@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
@@ -551,6 +552,24 @@ class EngineTests(unittest.TestCase):
         self.assertEqual({row.key for row in rows}, {'roms/nes/Game.nes', 'roms/custom-nes/Game.nes'})
 
     def test_large_queue_pages_are_bounded_without_enqueuing_all_futures(self):
+        # This exercises the 20,000-row UI/scheduler boundary. Real recovery
+        # reads and writes are covered separately; portable-drive latency must
+        # not turn this queue test into a whole-library database benchmark.
+        class QueueState:
+            def __init__(self, root):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def previous(self, game):
+                return None
+            def batch(self):
+                return nullcontext()
+            def record(self, game, status, **diagnostics):
+                pass
+            def pending(self):
+                return []
         provider = FakeProvider()
         provider.workers = 1
         provider.release.clear()
@@ -573,21 +592,29 @@ class EngineTests(unittest.TestCase):
         games = [Game(self.system, self.path/f'{index}.nes', f'{index}.nes', f'Game {index}') for index in range(20000)]
         engine = ScrapeEngine(self.root, provider, process_running=lambda: True)
         with patch('novacore_scraper.engine.existing_artwork', return_value=None), \
+                patch('novacore_scraper.engine.State', QueueState), \
                 patch('novacore_scraper.engine.ThreadPoolExecutor', RecordingExecutor):
-            engine.start(games)
-            self.addCleanup(engine.stop)
-            self.assertTrue(entered.wait(5))
-            page, total = engine.jobs_page(offset=100, limit=10000)
-            self.assertEqual((len(page), total), (200, 20000))
-            self.assertEqual(page[0].title, 'Game 100')
-            self.assertEqual(engine.jobs_page(query='Game 19999')[1], 1)
-            self.assertEqual(provider.calls, [])
-            release.set()
-            self.assertTrue(provider.entered.wait(2))
-            self.assertFalse(third_submitted.wait(.1))
-            self.assertEqual(len(submissions), 2)
-            engine.cancel_all()
-            self.assertTrue(engine.wait(5))
+            try:
+                engine.start(games)
+                self.assertTrue(entered.wait(5))
+                page, total = engine.jobs_page(offset=100, limit=10000)
+                self.assertEqual((len(page), total), (200, 20000))
+                self.assertEqual(page[0].title, 'Game 100')
+                self.assertEqual(engine.jobs_page(query='Game 19999')[1], 1)
+                self.assertEqual(provider.calls, [])
+                release.set()
+                self.assertTrue(provider.entered.wait(2))
+                self.assertFalse(third_submitted.wait(.1))
+                self.assertEqual(len(submissions), 2)
+                engine.cancel_all()
+                self.assertTrue(engine.wait(5))
+            finally:
+                # Join while patches and the temporary library still exist,
+                # including when an assertion fails before preparation starts.
+                engine.stop()
+                release.set()
+                provider.release.set()
+                engine.wait()
         self.assertEqual(engine.snapshot().cancelled, 20000)
 
     def test_transient_failures_retry_boundedly_with_unique_job_counts_and_diagnostics(self):

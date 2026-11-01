@@ -134,6 +134,8 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(games[0].existing_artwork, box)
 
     def test_scan_uses_directory_file_information_and_checks_indexed_covers_once(self):
+        from collections import Counter
+        import traceback
         system = self.system('snes', ('.sfc',))
         entries = []
         for index in range(100):
@@ -144,14 +146,17 @@ class LibraryTests(unittest.TestCase):
         self.write('roms/snes/gamelist.xml', '<gameList>'+''.join(entries)+'</gameList>')
         original = Path.stat
         calls = []
+        callers = Counter()
         def counted(path, *args, **kwargs):
             calls.append(path)
+            callers[tuple(frame.name for frame in traceback.extract_stack(limit=4)[:-1])] += 1
             return original(path, *args, **kwargs)
         with patch.object(Path, 'stat', counted):
             games = library.scan_system(system)
         self.assertEqual(len(games), 100)
         self.assertTrue(all(game.existing_artwork is not None for game in games))
-        self.assertLess(len(calls), 50, 'freshly indexed ROMs and thumbnails should not each be restatted by Path')
+        self.assertLess(len(calls), 50,
+            'freshly indexed ROMs and thumbnails should not each be restatted by Path: ' + str(callers))
 
     def test_live_artwork_recheck_rejects_image_directory_replaced_by_link(self):
         system = self.system('snes', ('.sfc',))
