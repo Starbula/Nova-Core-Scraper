@@ -22,6 +22,8 @@ Automatic uses Libretro, LaunchBox and GameTDB, then adds complete configured ac
 
 Meaningful parenthetical text, editions, hacks, prototypes, demos and unknown qualifiers remain part of identity. A plain alternate name cannot hide a qualified canonical game or another conflicting variant sharing an ID. Full title equivalence can match a parenthetical subtitle against equivalent plain punctuation. Where the source supplies IDs, ambiguity is resolved before cover availability or regional preferences; multiple conflicting matching IDs remain unresolved.
 
+Game Boy/Color/Advance and Nintendo DS request titles may omit the exact four-digit archive prefix `#### - `. Canonical provider names and true numeric titles retain digits. Computer title variants are scoped to documented TOSEC date/publisher structure: Libretro retains the publisher; LaunchBox may remove it from the lookup only with exact official publisher and known release-year corroboration. Verified Spectrum memory labels and a selected C64's terminal `(C64)` label are metadata. Filename-selected qualifiers remain authoritative, and unknown modifiers are never discarded. Lowercase TOSEC language flags do not establish a cover country.
+
 Default `MatchPolicy(allow_other_regions=True, allow_base_cover=True)` allows an identified base game's box to represent a plain revision/version/disc packaging variant, and permits another region's cover after preferred choices. The actual source, region, matched title and fallback note are retained. Both options have strict opt-outs in Settings. These options do not authorize substituting a sequel or unrelated hack.
 
 Every adapter exposes ranked, lazy `candidates()` while `find()` remains first-result compatible. The engine can try another front image from the same verified game after a removed, corrupt or unavailable preferred asset, then continue to another source. HTTP404 artwork absence is distinguished from a temporary network failure.
@@ -60,6 +62,8 @@ The adapter uses documented platform lists, platform-filtered `v1.1/Games/ByGame
 
 The API's documented box-image schema does not prove a region, so generic images are not assigned a fabricated country. Account allowance responses constrain API calls; credential/quota failures are isolated from other sources. Public image downloads do not receive the API key. Cached metadata and cache filenames exclude credentials and reject echoed secrets.
 
+The [official middleware](https://github.com/TheGamesDB/TheGamesDBv2/blob/df83194004b5e62fd2a810d595415f2559e16c97/API/include/middleware.php) returns HTTP 403 with a zero allowance for an exhausted account; its generic 403 text misleadingly mentions an invalid key. NovaCore uses validated numeric allowance fields rather than that text. Confirmed zero allowance is quota exhaustion; HTTP 401 is authentication rejection; an unproven 403 is an access refusal. Remote status text and credential echoes are never copied into reports or caches. A quota response cannot invalidate an already paid successful response or its public image download.
+
 ## IGDB
 
 Primary sources: [IGDB API documentation](https://api-docs.igdb.com/) and [Twitch client-credentials flow](https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/#client-credentials-flow-example).
@@ -67,6 +71,8 @@ Primary sources: [IGDB API documentation](https://api-docs.igdb.com/) and [Twitc
 Setup requires a Twitch account with two-factor authentication, a registered Confidential application, Client ID and Client Secret. Tokens are obtained through a form-body POST and refreshed once after an expired-token response; tokens are never persisted. Read queries use authenticated POST requests. The adapter enforces the documented four requests per second and eight open requests.
 
 Requested platform membership and unique game identity are verified. Regional `game_localizations` covers can be used, but a language-only locale such as `fr`, `de` or `en` is not proof of a country. Country-bearing locales and geographic categories are handled separately. IGDB cover objects have no physical platform-packaging dimension: each returned candidate is labelled **Game-level cover; platform-specific packaging is unverified**. This limitation remains visible in results rather than being represented as a verified scan for a particular port.
+
+For NES/Famicom libraries, IGDB's separately catalogued NES and Family Computer records form one explicit regional machine scope. Famicom Disk System and clone aliases remain outside that scope. Distinct game IDs with the same title remain ambiguous across both regional records; IDs are resolved from the platform catalogue, not hardcoded.
 
 ## MobyGames
 

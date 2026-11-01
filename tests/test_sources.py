@@ -68,6 +68,26 @@ def test_find_stops_at_first_match():
     assert second.lookups == 0
 
 
+def test_access_refusal_is_not_reported_as_a_wrong_password():
+    class AccessRefused(AuthenticationError):
+        reason = 'access_refused'
+        retryable = False
+
+    source = Stub('TheGamesDB', find_error=AccessRefused('The source refused access.'))
+    chain = FallbackProvider([source, Stub('Libretro')])
+    for _ in range(2):
+        with pytest.raises(ProviderError) as error:
+            chain.find(object(), lambda: None)
+        assert error.value.reason == 'access_refused'
+        assert not error.value.retryable
+        assert 'credentials' not in str(error.value)
+    assert source.lookups == 1
+    assert chain.source_statuses()[0].state == 'access_refused'
+    # A late network failure must not replace a permanent access restriction.
+    chain._failed(source, ProviderError('Network request failed.'))
+    assert chain.source_statuses()[0].state == 'access_refused'
+
+
 @pytest.mark.parametrize('failure', [ProviderError('https://secret/'), AuthenticationError('private credential'), QuotaError('private account')])
 def test_lookup_failure_is_deferred_until_healthy_candidate_is_consumed(failure):
     first = Stub('Libretro', find_error=failure)

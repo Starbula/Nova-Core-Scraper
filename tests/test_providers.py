@@ -1032,3 +1032,40 @@ def test_screenscraper_disagreeing_qualified_aliases_never_authorize_variants(pr
     p = ss_provider(provider_module, tmp_path)
     p._rate = lambda checkpoint: checkpoint()
     assert p.find(game(tmp_path, requested + ' (Europe)'), lambda: None) is None
+
+
+def test_libretro_tosec_fallback_keeps_publisher_and_exact_matches_first(provider_module, transport, tmp_path):
+    routes, _ = transport
+    title = '180 (1986)(Mastertronic Added Dimension)(128k)'
+    routes['/Sinclair%20-%20ZX%20Spectrum/Named_Boxarts/'] = 200, (
+        '<a href="180 (CCS).png">other publisher</a>'
+        '<a href="180 (Mastertronic Added Dimension).png">publisher cover</a>'
+        '<a href="180 (1986)(Mastertronic Added Dimension)(128k).png">exact cover</a>'), {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    results = list(p.candidates(game(tmp_path, title, 'zxspectrum'), lambda: None))
+    assert [item.matched_title for item in results] == [title, '180 (Mastertronic Added Dimension)']
+    assert results[0].match_note == '' and results[1].match_note
+    assert 'CCS' not in results[1].matched_title
+
+
+def test_libretro_tosec_fallback_matches_live_style_publisher_name(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/Sinclair%20-%20ZX%20Spectrum/Named_Boxarts/'] = 200, (
+        '<a href="Back to Skool (Microsphere).png">publisher cover</a>'
+        '<a href="Back to Skool (Other Publisher).png">wrong publisher</a>'), {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    result = p.find(game(tmp_path, 'Back to Skool (1985)(Microsphere)(128k)', 'zxspectrum'), lambda: None)
+    assert result and result.matched_title == 'Back to Skool (Microsphere)' and result.match_note
+
+
+@pytest.mark.parametrize('filename,display', [
+    ('Back to Skool (Hack)', 'Back to Skool (1985)(Microsphere)'),
+    ('Different Game 2 (Hack)', 'Back to Skool (1985)(Microsphere)'),
+    ('Back to Skool (1985)(Microsphere)(Hack)', 'Back to Skool'),
+])
+def test_libretro_tosec_fallback_never_drops_filename_hack(provider_module, transport, tmp_path, filename, display):
+    routes, _ = transport
+    routes['/Sinclair%20-%20ZX%20Spectrum/Named_Boxarts/'] = 200, '<a href="Back to Skool (Microsphere).png">base game</a>', {}
+    original = game(tmp_path, filename, 'zxspectrum')
+    item = Game(original.system, original.path, original.relative_path, display)
+    assert provider_module.LibretroProvider(tmp_path / 'cache', interval=0).find(item, lambda: None) is None

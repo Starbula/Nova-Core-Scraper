@@ -7,6 +7,8 @@ old one, which remains usable when a refresh fails.
 from __future__ import annotations
 
 import zlib
+import unicodedata
+from datetime import date
 from contextlib import closing
 import os
 import re
@@ -25,15 +27,16 @@ from xml.sax.handler import ContentHandler, feature_external_ges, feature_extern
 import requests
 
 from .models import Artwork, Game
+from .computer_titles import computer_title_variants
 from .providers import CACHE_SECONDS, Cancelled, Checkpoint, ProviderError, _Provider, _region
-from .matching import MatchPolicy, match_note, region_rank, requested_info, title_info
+from .matching import MatchPolicy, TitleInfo, match_note, region_rank, requested_title_variants, title_info
 
 CATALOGUE_URL = 'https://gamesdb.launchbox-app.com/Metadata.zip'
 IMAGE_BASE_URL = 'https://images.launchbox-app.com/'
 MAX_CATALOGUE_BYTES = 256 * 1024 * 1024
 MAX_XML_BYTES = 1024 * 1024 * 1024
 MAX_FIELD_CHARS = 4096
-_INDEX_VERSION = 2
+_INDEX_VERSION = 3
 _FILENAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_. -]{0,199}\.(?:png|jpe?g|webp)', re.IGNORECASE)
 
 # Exact export platform names. Aliases share a platform only when the console is
@@ -82,6 +85,35 @@ LAUNCHBOX_SYSTEMS = {
     'bbcmicro': 'BBC Microcomputer System',
     'cdi': 'Philips CD-i', 'ngage': 'Nokia N-Gage', 'windows': 'Windows',
 }
+
+
+def _publisher_key(value: str) -> str:
+    # Publisher corroboration is exact apart from Unicode form, case and
+    # whitespace. Do not infer company aliases, remove suffixes or substrings.
+    value = ' '.join(unicodedata.normalize('NFKC', value).casefold().split())
+    if value in {'', '-', '?', 'unknown', 'n/a', 'none', 'various', 'not known'}:
+        return ''
+    return value
+
+
+def _release_year(release_date: str, release_year: str) -> int | None:
+    """Require a complete known year and reject conflicting/malformed fields."""
+    years = []
+    if release_date:
+        if re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', release_date):
+            try:
+                years.append(date.fromisoformat(release_date).year)
+            except ValueError:
+                return None
+        else:
+            return None
+    if release_year:
+        if not re.fullmatch(r'[0-9]{4}', release_year):
+            return None
+        years.append(int(release_year))
+    if not years or not 1 <= years[0] <= 9999 or len(set(years)) != 1:
+        return None
+    return years[0]
 
 
 def _safe_filename(value: str) -> bool:
@@ -140,7 +172,7 @@ class _XMLStream:
 
 class _CatalogueHandler(ContentHandler):
     FIELDS = {
-        'Game': {'DatabaseID', 'Name', 'Platform'},
+        'Game': {'DatabaseID', 'Name', 'Platform', 'Publisher', 'ReleaseDate', 'ReleaseYear'},
         'GameAlternateName': {'DatabaseID', 'AlternateName'},
         'GameImage': {'DatabaseID', 'FileName', 'Type', 'Region'},
     }
@@ -201,8 +233,9 @@ class _CatalogueHandler(ContentHandler):
         if self.kind == 'Game':
             name, platform = data.get('Name', ''), data.get('Platform', '')
             if name and platform:
-                self.connection.execute('INSERT INTO games VALUES (?, ?, ?)',
-                                        (database_id, platform, name))
+                self.connection.execute('INSERT INTO games VALUES (?, ?, ?, ?, ?, ?)',
+                                        (database_id, platform, name, data.get('Publisher', ''),
+                                         data.get('ReleaseDate', ''), data.get('ReleaseYear', '')))
                 self._name(database_id, name)
                 self.games += 1
         elif self.kind == 'GameAlternateName' and data.get('AlternateName'):
@@ -264,7 +297,7 @@ class LaunchBoxProvider(_Provider):
                     return False
                 connection.execute('SELECT game_id, base, name FROM names LIMIT 1').fetchone()
                 connection.execute('SELECT game_id, filename, region FROM images LIMIT 1').fetchone()
-                return connection.execute('SELECT name FROM games LIMIT 1').fetchone() is not None
+                return connection.execute('SELECT name, publisher, release_date, release_year FROM games LIMIT 1').fetchone() is not None
         except (sqlite3.Error, OSError, ValueError):
             return False
 
@@ -357,7 +390,8 @@ class LaunchBoxProvider(_Provider):
             connection.execute('PRAGMA journal_mode=OFF')
             connection.execute('PRAGMA synchronous=OFF')
             connection.execute('PRAGMA temp_store=FILE')
-            connection.executescript('CREATE TABLE games (game_id INTEGER PRIMARY KEY, platform TEXT NOT NULL, name TEXT NOT NULL);'
+            connection.executescript('CREATE TABLE games (game_id INTEGER PRIMARY KEY, platform TEXT NOT NULL, name TEXT NOT NULL, '
+                                     'publisher TEXT NOT NULL, release_date TEXT NOT NULL, release_year TEXT NOT NULL);'
                                      'CREATE TABLE names (game_id INTEGER, base TEXT, name TEXT);'
                                      'CREATE TABLE images (game_id INTEGER, filename TEXT, region TEXT);')
             _check_archive_directory(archive_path)
@@ -406,6 +440,30 @@ class LaunchBoxProvider(_Provider):
         finally:
             connection.close()
 
+    def _title_matches(self, connection, platform, requested, publisher=None, year=None, note=''):
+        candidates = connection.execute(
+            'SELECT DISTINCT games.game_id, games.name, names.name, games.publisher, '
+            'games.release_date, games.release_year FROM names JOIN games USING (game_id) '
+            'WHERE games.platform=? AND names.base=?', (platform, requested.key)).fetchall()
+        matches = {}
+        for game_id, canonical_name, alias, official_publisher, release_date, release_year in candidates:
+            canonical, alternate = title_info(canonical_name), title_info(alias)
+            # A verified alias cannot erase a hack, prototype, edition, or
+            # other meaningful qualifier on its canonical game.
+            if canonical.key != requested.key and canonical.qualifiers != requested.qualifiers:
+                continue
+            if publisher is not None and (
+                    _publisher_key(official_publisher) != publisher
+                    or _release_year(release_date, release_year) != year):
+                continue
+            if not self.match_policy.allow_base_cover and (
+                    canonical.packaging != requested.packaging or alternate.packaging != requested.packaging):
+                continue
+            choice = (alternate.packaging != requested.packaging, alias, canonical, requested, note)
+            if game_id not in matches or choice[:2] < matches[game_id][:2]:
+                matches[game_id] = choice
+        return matches
+
     def find(self, game: Game, checkpoint: Checkpoint) -> Artwork | None:
         return next(self.candidates(game, checkpoint), None)
 
@@ -418,32 +476,46 @@ class LaunchBoxProvider(_Provider):
             self._unmatched('unsupported_platform', 'LaunchBox has no verified platform mapping for this system.')
             return None
         self.prepare(checkpoint)
-        requested = requested_info(game)
+        variants = requested_title_variants(game)
+        requested = variants[0].info
         try:
             with closing(self._connect()) as connection:
-                candidates = connection.execute(
-                    'SELECT DISTINCT games.game_id, games.name, names.name FROM names JOIN games USING (game_id) '
-                    'WHERE games.platform=? AND names.base=?', (platform, requested.key)).fetchall()
-                matches = {}
-                for game_id, canonical_name, alias in candidates:
-                    canonical, alternate = title_info(canonical_name), title_info(alias)
-                    # A verified alias cannot erase a hack, prototype, edition,
-                    # or other meaningful qualifier on its canonical game.
-                    if canonical.key != requested.key and canonical.qualifiers != requested.qualifiers:
-                        continue
-                    if not self.match_policy.allow_base_cover and (
-                            canonical.packaging != requested.packaging or alternate.packaging != requested.packaging):
-                        continue
-                    choice = (alternate.packaging != requested.packaging, alias, canonical)
-                    if game_id not in matches or choice[:2] < matches[game_id][:2]:
-                        matches[game_id] = choice
+                matches = self._title_matches(connection, platform, requested)
+                if not matches:
+                    # Publisher-preserving TOSEC and selected-system labels
+                    # keep the normal exact title/alias uniqueness checks.
+                    for alternate in variants[1:]:
+                        for game_id, choice in self._title_matches(
+                                connection, platform, alternate.info, note=alternate.note).items():
+                            if game_id not in matches or choice[:2] < matches[game_id][:2]:
+                                matches[game_id] = choice
+                if not matches:
+                    # TOSEC's year and publisher may be omitted from the lookup
+                    # only when the official record corroborates both. The
+                    # parser preserves every meaningful/unknown modifier.
+                    for variant in computer_title_variants(game):
+                        # The helper validates the complete TOSEC date. Its
+                        # month/day may be unknown; the year must be known.
+                        year = _release_year('', variant.date.split('-', 1)[0])
+                        publisher = _publisher_key(variant.publisher)
+                        if year is None or not publisher or not variant.base_title:
+                            continue
+                        info = title_info(variant.base_title)
+                        effective = TitleInfo(info.key, variants[-1].info.regions,
+                                              info.qualifiers, variants[-1].info.packaging or info.packaging, info.title)
+                        note = ('TOSEC title confirmed by official publisher and release year '
+                                + str(year) + '. ' + variant.note).strip()
+                        for game_id, choice in self._title_matches(
+                                connection, platform, effective, publisher, year, note).items():
+                            if game_id not in matches or choice[:2] < matches[game_id][:2]:
+                                matches[game_id] = choice
                 # Identity is settled before inspecting image availability or region.
                 if len(matches) != 1:
                     self._unmatched('ambiguous_title' if matches else 'no_title_match',
                                     'Several LaunchBox game IDs share this title; review is required.' if matches
                                     else 'No exact title or verified alias matches this LaunchBox platform.')
                     return None
-                game_id, (_, alias, candidate) = next(iter(matches.items()))
+                game_id, (_, alias, candidate, requested, identity_note) = next(iter(matches.items()))
                 rows = connection.execute('SELECT filename, region FROM images WHERE game_id=? ORDER BY filename', (game_id,)).fetchall()
         except sqlite3.Error:
             raise ProviderError('The cached LaunchBox catalogue could not be read. Try again.') from None
@@ -466,5 +538,5 @@ class LaunchBoxProvider(_Provider):
             if not _safe_filename(filename):
                 raise ProviderError('The cached LaunchBox catalogue contains an unsafe artwork filename.')
             yield Artwork(IMAGE_BASE_URL + filename.replace(' ', '%20'), self.name, region,
-                          match_note=match_note(requested, candidate, region), matched_title=alias,
+                          match_note=' '.join(filter(None, (identity_note, match_note(requested, candidate, region)))), matched_title=alias,
                           provider_game_id=str(game_id))

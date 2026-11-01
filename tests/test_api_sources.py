@@ -92,6 +92,14 @@ def ig_games():
              'url': '//images.igdb.com/igdb/image/upload/t_thumb/co1abc.jpg'}}]
 
 
+def ig_nes_platforms():
+    # Public IGDB platform names/slugs; IDs are deliberately synthetic fixtures.
+    return [{'id': 1801, 'name': 'Nintendo Entertainment System', 'slug': 'nes'},
+            {'id': 9902, 'name': 'Family Computer', 'slug': 'famicom'},
+            {'id': 7703, 'name': 'Family Computer Disk System', 'slug': 'fds'},
+            {'id': 8804, 'name': 'Retro NES Clone', 'alternative_name': 'NES', 'slug': 'retro-nes-clone'}]
+
+
 def configure_ig(routes):
     routes['/oauth2/token'] = 200, {'access_token': 'fixture-token', 'expires_in': 3600, 'token_type': 'bearer'}, {}
     routes['/v4/platforms'] = 200, ig_platforms(), {}
@@ -158,16 +166,20 @@ def test_tgdb_exhausted_allowance_stops_future_requests(api, transport, tmp_path
 
 
 @pytest.mark.parametrize('automatic', [False, True])
-def test_tgdb_quota_denial_preserves_paid_inflight_match_and_public_download(api, transport, tmp_path, monkeypatch, automatic):
-    from novacore_scraper.sources import FallbackProvider
+@pytest.mark.parametrize('remote', [False, True])
+def test_tgdb_quota_denial_preserves_paid_inflight_match_and_public_download(api, transport, tmp_path, monkeypatch, automatic, remote):
+    from novacore_scraper.sources import FallbackProvider, error_diagnostic
 
     routes, calls = transport
     platform_data = tg_platforms()
-    platform_data['remaining_monthly_allowance'] = 1
+    platform_data['remaining_monthly_allowance'] = 2 if remote else 1
     routes['/v1/Platforms'] = 200, platform_data, {}
     sent, release_response = threading.Event(), threading.Event()
 
     def final_paid_search(request):
+        if remote and parse_qs(urlsplit(request.url).query)['name'] != ['Sonic the Hedgehog']:
+            return 403, {'code': 403, 'status': 'Invalid API key was provided.',
+                         'remaining_monthly_allowance': 0, 'allowance_refresh_timer': 86400}, {}
         sent.set()
         assert release_response.wait(5), 'The paid search was not released.'
         data = tg_games()
@@ -188,7 +200,7 @@ def test_tgdb_quota_denial_preserves_paid_inflight_match_and_public_download(api
             assert sent.wait(5), 'The last permitted search was not sent.'
             with pytest.raises(ProviderError) as error:
                 source.find(game(tmp_path, 'Another title'), lambda: None)
-            assert getattr(error.value, 'reason', '') == 'allowance_unconfirmed'
+            assert error_diagnostic(error.value)[0] == ('quota_exhausted' if remote else 'allowance_unconfirmed')
         finally:
             release_response.set()
         artwork = paid.result(timeout=5)
@@ -199,8 +211,11 @@ def test_tgdb_quota_denial_preserves_paid_inflight_match_and_public_download(api
         assert decoded.size == (2, 3)
     with pytest.raises(ProviderError):
         source.find(game(tmp_path, 'Third title'), lambda: None)
-    assert [urlsplit(request.url).path for request in calls] == [
-        '/v1/Platforms', '/v1.1/Games/ByGameName', '/images/original/boxart/front/92-1.jpg']
+    expected = ['/v1/Platforms', '/v1.1/Games/ByGameName']
+    if remote:
+        expected.append('/v1.1/Games/ByGameName')
+    expected.append('/images/original/boxart/front/92-1.jpg')
+    assert [urlsplit(request.url).path for request in calls] == expected
 
 
 def test_tgdb_authentication_latch_still_aborts_inflight_catalogue_response(api, transport, tmp_path, monkeypatch):
@@ -271,6 +286,69 @@ def test_tgdb_reported_zero_is_confirmed_quota_exhaustion(api, transport, tmp_pa
     stats = provider.request_stats()
     assert stats['remaining'] == 0 and stats['local_budget'] == 0
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('status,payload,kind,reason,remaining', [
+    (403, {'code': 403, 'status': 'Invalid API key was provided.',
+           'remaining_monthly_allowance': 0, 'allowance_refresh_timer': 86400}, QuotaError, 'quota_exhausted', 0),
+    (403, {'code': 403, 'status': 'fixture-secret https://provider.invalid/?apikey=fixture-secret',
+           'remaining_monthly_allowance': 0, 'extra_allowance': 0}, QuotaError, 'quota_exhausted', 0),
+    (200, {'code': 403, 'status': 'Invalid API key was provided.',
+           'remaining_monthly_allowance': 0, 'allowance_refresh_timer': 86400}, QuotaError, 'quota_exhausted', 0),
+    (401, {'code': 401, 'remaining_monthly_allowance': 0, 'allowance_refresh_timer': 0},
+     AuthenticationError, 'authentication', None),
+    (401, {'code': 403, 'remaining_monthly_allowance': 0, 'extra_allowance': 0},
+     AuthenticationError, 'authentication', None),
+    (403, {'code': 403, 'remaining_monthly_allowance': 4, 'extra_allowance': 0},
+     AuthenticationError, 'access_refused', 4),
+    (403, {'code': 403, 'remaining_monthly_allowance': 0, 'extra_allowance': 2},
+     AuthenticationError, 'access_refused', 2),
+    (403, {'code': 403, 'status': 'Invalid API key was provided.'},
+     AuthenticationError, 'access_refused', None),
+    (403, {'code': 403, 'remaining_monthly_allowance': '0'}, AuthenticationError, 'access_refused', None),
+    (403, {'code': 403, 'remaining_monthly_allowance': False}, AuthenticationError, 'access_refused', None),
+    (403, {'code': 403, 'remaining_monthly_allowance': 0.0}, AuthenticationError, 'access_refused', None),
+    (403, {'code': 403, 'remaining_monthly_allowance': -1}, AuthenticationError, 'access_refused', None),
+    (403, {'code': 403, 'remaining_monthly_allowance': 0, 'extra_allowance': '0'},
+     AuthenticationError, 'access_refused', None),
+    (403, b'<html>fixture-secret</html>', AuthenticationError, 'access_refused', None),
+])
+def test_tgdb_access_response_distinguishes_proven_quota_from_authentication(api, transport, tmp_path, monkeypatch,
+                                                                         status, payload, kind, reason, remaining):
+    routes, calls = transport
+    routes['/v1/Platforms'] = status, payload, {}
+    provider = api.TheGamesDBProvider(tmp_path / 'cache', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    for _ in range(2):
+        with pytest.raises(kind) as error:
+            provider.check_connection(lambda: None)
+        assert getattr(error.value, 'reason', None) == ('access_refused' if reason == 'access_refused' else None)
+        assert not getattr(error.value, 'retryable', False)
+        assert 'fixture-secret' not in str(error.value)
+    assert provider.request_stats()['remaining'] == remaining
+    assert len(calls) == 1
+    assert not list((tmp_path / 'cache').glob('*'))
+
+
+def test_tgdb_confirmed_remote_quota_preserves_public_image_download(api, transport, tmp_path, monkeypatch):
+    from novacore_scraper.models import Artwork
+
+    routes, calls = transport
+    routes['/v1/Platforms'] = 403, {'code': 403, 'status': 'Invalid API key was provided.',
+        'remaining_monthly_allowance': 0, 'allowance_refresh_timer': 86400}, {}
+    image = io.BytesIO()
+    Image.new('RGB', (2, 3), 'blue').save(image, 'PNG')
+    routes['/images/original/boxart/front/92-1.jpg'] = 200, image.getvalue(), {}
+    provider = api.TheGamesDBProvider(tmp_path / 'cache', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    with pytest.raises(QuotaError):
+        provider.check_connection(lambda: None)
+    destination = tmp_path / 'front.png'
+    provider.download(Artwork('https://cdn.thegamesdb.net/images/original/boxart/front/92-1.jpg', 'TheGamesDB'),
+                      destination, lambda: None)
+    with Image.open(destination) as decoded:
+        assert decoded.size == (2, 3)
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('kind', ['tgdb', 'igdb'])
@@ -400,6 +478,72 @@ def test_igdb_never_crosses_platforms_or_selects_sequels(api, transport, tmp_pat
     configure_ig(routes)
     routes['/v4/games'] = 200, [candidate], {}
     assert api.IGDBProvider(tmp_path / 'cache', 'client', 'secret', interval=0).find(game(tmp_path), lambda: None) is None
+
+
+@pytest.mark.parametrize('system', ['nes', 'famicom'])
+@pytest.mark.parametrize('platform', [1801, 9902])
+def test_igdb_nes_family_searches_only_explicit_nes_and_famicom_platforms(api, transport, tmp_path, monkeypatch, system, platform):
+    routes, calls = transport
+    configure_ig(routes)
+    routes['/v4/platforms'] = 200, ig_nes_platforms(), {}
+    routes['/v4/games'] = 200, [{'id': 42, 'name': 'Balloon Fight', 'platforms': [platform],
+                               'cover': {'image_id': 'co_nes'}}], {}
+    provider = api.IGDBProvider(tmp_path / 'cache', 'client', 'secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    requested = game(tmp_path, 'Balloon Fight', system=system)
+    artwork = provider.find(requested, lambda: None)
+    assert artwork is not None and artwork.provider_game_id == '42'
+    query = calls[-1].body.decode() if isinstance(calls[-1].body, bytes) else calls[-1].body
+    assert 'where platforms = (1801,9902);' in query
+    assert '7703' not in query and '8804' not in query
+    cached = api.IGDBProvider(tmp_path / 'cache', 'client', 'secret', interval=0)
+    assert cached.find(requested, lambda: None) == artwork
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize('same_id', [True, False])
+def test_igdb_nes_family_preserves_game_id_uniqueness_across_regions(api, transport, tmp_path, monkeypatch, same_id):
+    routes, _ = transport
+    configure_ig(routes)
+    routes['/v4/platforms'] = 200, ig_nes_platforms(), {}
+    routes['/v4/games'] = 200, [
+        {'id': 42, 'name': 'Balloon Fight', 'platforms': [1801], 'cover': {'image_id': 'co_nes'}},
+        {'id': 42 if same_id else 43, 'name': 'Balloon Fight', 'platforms': [9902], 'cover': {'image_id': 'co_famicom'}},
+    ], {}
+    provider = api.IGDBProvider(tmp_path / 'cache', 'client', 'secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    artwork = provider.find(game(tmp_path, 'Balloon Fight', system='nes'), lambda: None)
+    assert (artwork is not None) is same_id
+    if artwork is not None:
+        assert artwork.provider_game_id == '42'
+    else:
+        assert provider.missing_reason()[0] == 'ambiguous_match'
+
+
+@pytest.mark.parametrize('platform', [7703, 8804])
+def test_igdb_nes_family_never_accepts_fds_or_clone_games(api, transport, tmp_path, monkeypatch, platform):
+    routes, _ = transport
+    configure_ig(routes)
+    routes['/v4/platforms'] = 200, ig_nes_platforms(), {}
+    routes['/v4/games'] = 200, [{'id': 42, 'name': 'Balloon Fight', 'platforms': [platform],
+                               'cover': {'image_id': 'co_wrong_machine'}}], {}
+    provider = api.IGDBProvider(tmp_path / 'cache', 'client', 'secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    assert provider.find(game(tmp_path, 'Balloon Fight', system='nes'), lambda: None) is None
+    assert provider.missing_reason()[0] == 'no_match'
+
+
+def test_igdb_nes_family_rejects_ambiguous_canonical_platform_records(api, transport, tmp_path, monkeypatch):
+    routes, calls = transport
+    configure_ig(routes)
+    platforms = ig_nes_platforms()
+    platforms.append({'id': 1802, 'name': 'Nintendo Entertainment System', 'slug': 'nes-duplicate'})
+    routes['/v4/platforms'] = 200, platforms, {}
+    provider = api.IGDBProvider(tmp_path / 'cache', 'client', 'secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    assert provider.find(game(tmp_path, 'Balloon Fight', system='nes'), lambda: None) is None
+    assert provider.missing_reason()[0] == 'unsupported_platform'
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('kind', ['tgdb', 'igdb'])

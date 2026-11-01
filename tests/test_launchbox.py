@@ -28,7 +28,7 @@ def catalogue(games=None, aliases=None, images=None):
     from xml.sax.saxutils import escape
     def row(tag, fields):
         return '<' + tag + '>' + ''.join('<' + key + '>' + escape(value) + '</' + key + '>' for key, value in fields) + '</' + tag + '>'
-    xml = '<LaunchBox>' + ''.join(row('Game', zip(('DatabaseID', 'Name', 'Platform'), item)) for item in games)
+    xml = '<LaunchBox>' + ''.join(row('Game', zip(('DatabaseID', 'Name', 'Platform', 'Publisher', 'ReleaseDate', 'ReleaseYear'), item)) for item in games)
     xml += ''.join(row('GameAlternateName', zip(('DatabaseID', 'AlternateName'), item)) for item in (aliases or []))
     xml += ''.join(row('GameImage', zip(('DatabaseID', 'FileName', 'Type', 'Region'), item)) for item in images) + '</LaunchBox>'
     output = io.BytesIO()
@@ -418,3 +418,197 @@ def test_engine_tries_another_launchbox_cover_after_404(tmp_path, transport):
     job = engine.jobs_page()[0][0]
     assert job.region == 'us' and 'region' in job.match_note.lower() and Path(job.artwork).is_file()
     assert calls[-2:] == ['https://images.launchbox-app.com/eu.jpg', 'https://images.launchbox-app.com/us.png']
+
+
+def test_tosec_title_requires_official_publisher_and_exact_year_before_base_cover(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', '180', 'Sinclair ZX Spectrum', 'CCS', '1984-01-01'),
+        ('2', '180', 'Sinclair ZX Spectrum', 'Mastertronic Added Dimension', '1986-01-01'),
+        ('3', '180', 'Commodore 64', 'Mastertronic Added Dimension', '1986-01-01'),
+    ], images=[('1', 'wrong.jpg', 'Box - Front', 'Europe'),
+               ('2', 'right.jpg', 'Box - Front', 'Europe'),
+               ('3', 'wrong-platform.jpg', 'Box - Front', 'Europe')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    result = p.find(game(tmp_path, '180 (1986)(Mastertronic Added Dimension)(128k)', 'zxspectrum'), lambda: None)
+    assert result and result.provider_game_id == '2'
+    assert result.url.endswith('/right.jpg')
+    assert 'publisher' in result.match_note.lower() and '1986' in result.match_note
+    p.close()
+
+
+def test_tosec_verified_alias_can_use_official_release_year(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', 'Alien 8', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '', '1985')],
+        aliases=[('1', 'Alien Eight')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    result = p.find(game(tmp_path, 'Alien Eight (1985)(Ultimate Play The Game)', 'zxspectrum'), lambda: None)
+    assert result and result.provider_game_id == '1'
+    assert result.matched_title == 'Alien Eight'
+    p.close()
+
+
+@pytest.mark.parametrize('publisher,release_date,release_year', [
+    ('', '1986-01-01', ''), ('Unknown', '1986-01-01', ''),
+    ('Mastertronic', '1986-01-01', ''), ('Mastertronic Added Dimension II', '1986-01-01', ''),
+    ('Mastertronic Added Dimension', '', ''), ('Mastertronic Added Dimension', '1984-01-01', ''),
+    ('Mastertronic Added Dimension', '1986-13-01', ''),
+    ('Mastertronic Added Dimension', '1986', ''),
+    ('Mastertronic Added Dimension', '1986-01-01garbage', ''),
+    ('Mastertronic Added Dimension', '', '1986?'),
+    ('Mastertronic Added Dimension', '1986-01-01', '1984'),
+    ('Mastertronic Added Dimension', 'bad', '1986'),
+])
+def test_tosec_fallback_rejects_missing_malformed_or_conflicting_corroboration(
+        tmp_path, transport, publisher, release_date, release_year):
+    transport[0].append(catalogue(games=[
+        ('1', '180', 'Sinclair ZX Spectrum', publisher, release_date, release_year)]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(game(tmp_path, '180 (1986)(Mastertronic Added Dimension)', 'zxspectrum'), lambda: None) is None
+    p.close()
+
+
+@pytest.mark.parametrize('title', [
+    '180 (19xx)(Mastertronic Added Dimension)', '180 (198?)(Mastertronic Added Dimension)',
+    '180 (1986)(Unknown)', '180 (1986)(-)',
+    '180 (1986)(Mastertronic Added Dimension)(Demo)',
+    '180 (1986)(Mastertronic Added Dimension)[h]',
+    '180 (1986)(Mastertronic Added Dimension)(Prototype)',
+    '180 (1986)(Mastertronic Added Dimension)(Custom Edition)',
+])
+def test_tosec_fallback_never_erases_unknown_year_publisher_or_modifiers(tmp_path, transport, title):
+    transport[0].append(catalogue(games=[
+        ('1', '180', 'Sinclair ZX Spectrum', 'Mastertronic Added Dimension', '1986-01-01')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(game(tmp_path, title, 'zxspectrum'), lambda: None) is None
+    p.close()
+
+
+def test_tosec_unqualified_alias_cannot_hide_a_modified_canonical_game(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', 'Alien 8 (Hack)', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '1985-01-01')],
+        aliases=[('1', 'Alien 8')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(game(tmp_path, 'Alien 8 (1985)(Ultimate Play The Game)', 'zxspectrum'), lambda: None) is None
+    p.close()
+
+
+def test_tosec_duplicate_verified_ids_are_ambiguous_before_images(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', '180', 'Sinclair ZX Spectrum', 'Mastertronic Added Dimension', '1986-01-01'),
+        ('2', '180', 'Sinclair ZX Spectrum', 'Mastertronic Added Dimension', '1986-01-01')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(game(tmp_path, '180 (1986)(Mastertronic Added Dimension)', 'zxspectrum'), lambda: None) is None
+    p.close()
+
+
+def test_tosec_filename_metadata_cannot_be_bypassed_by_a_short_display_title(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', '180', 'Sinclair ZX Spectrum', 'CCS', '1984-01-01')]))
+    item = game(tmp_path, '180 (1986)(Mastertronic Added Dimension)', 'zxspectrum')
+    item = Game(item.system, item.path, item.path.name, '180')
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(item, lambda: None) is None
+    p.close()
+
+
+def test_schema_two_cache_is_refreshed_even_when_fresh_and_retains_metadata(tmp_path, transport):
+    import sqlite3
+    transport[0].append(catalogue())
+    cache = tmp_path / 'cache'
+    p = LaunchBoxProvider(cache)
+    p.prepare(lambda: None)
+    p.close()
+    index = next(cache.glob('*.sqlite3'))
+    with sqlite3.connect(index) as connection:
+        connection.execute('PRAGMA user_version=2')
+    transport[0].append(catalogue(games=[
+        ('1', 'Alien 8', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '', '1985')]))
+    p = LaunchBoxProvider(cache)
+    assert p.find(game(tmp_path, 'Alien 8 (1985)(Ultimate Play The Game)', 'zxspectrum'), lambda: None)
+    with sqlite3.connect(index) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0] >= 3
+        assert connection.execute('SELECT publisher, release_date, release_year FROM games').fetchone() == ('Ultimate Play The Game', '', '1985')
+    assert len(transport[1]) == 2
+    p.close()
+
+
+def test_failed_schema_upgrade_preserves_previous_cache_atomically(tmp_path, transport):
+    import sqlite3
+    transport[0].append(catalogue())
+    cache = tmp_path / 'cache'
+    p = LaunchBoxProvider(cache)
+    p.prepare(lambda: None)
+    p.close()
+    index = next(cache.glob('*.sqlite3'))
+    with sqlite3.connect(index) as connection:
+        connection.execute('PRAGMA user_version=2')
+    previous = index.read_bytes()
+    transport[0].append(b'invalid zip')
+    p = LaunchBoxProvider(cache)
+    with pytest.raises(ProviderError):
+        p.prepare(lambda: None)
+    assert index.read_bytes() == previous
+    assert list(cache.iterdir()) == [index]
+    p.close()
+
+
+def test_tosec_display_cannot_erase_hacked_filename_identity(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', 'Alien 8', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '1985-01-01')]))
+    item = game(tmp_path, 'Alien 8 (Hack)', 'zxspectrum')
+    item = Game(item.system, item.path, item.path.name, 'Alien 8 (1985)(Ultimate Play The Game)')
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(item, lambda: None) is None
+    p.close()
+
+
+def test_tosec_display_cannot_replace_a_different_filename_title_with_the_same_modifier(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', 'Alien 8 (Hack)', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '1985-01-01')]))
+    item = game(tmp_path, 'Different Game (Hack)', 'zxspectrum')
+    item = Game(item.system, item.path, item.path.name, 'Alien 8 (1985)(Ultimate Play The Game)')
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(item, lambda: None) is None
+    p.close()
+
+
+def test_c64_terminal_system_label_uses_exact_selected_platform_title(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', 'Tapper', 'Commodore 64'), ('2', 'Tapper', 'Arcade')],
+        images=[('1', 'c64.jpg', 'Box - Front', 'Europe'), ('2', 'arcade.jpg', 'Box - Front', 'Europe')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    result = p.find(game(tmp_path, 'Tapper (C64)', 'c64'), lambda: None)
+    assert result and result.provider_game_id == '1' and result.url.endswith('/c64.jpg')
+    assert 'C64' in result.match_note
+    assert p.find(game(tmp_path, 'Tapper (C64)', 'arcade'), lambda: None) is None
+    assert p.find(game(tmp_path, 'Tapper (C64) (Hack)', 'c64'), lambda: None) is None
+    p.close()
+
+
+def test_c64_system_label_does_not_hide_duplicate_ids_without_images(tmp_path, transport):
+    transport[0].append(catalogue(games=[
+        ('1', 'Tapper', 'Commodore 64'), ('2', 'Tapper', 'Commodore 64')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(game(tmp_path, 'Tapper (C64)', 'c64'), lambda: None) is None
+    p.close()
+
+
+@pytest.mark.parametrize('tag,expected', [('es', 'us'), ('ES', 'es')])
+def test_tosec_lowercase_language_is_not_an_explicit_country(tmp_path, transport, tag, expected):
+    transport[0].append(catalogue(games=[
+        ('1', 'Alien 8', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '1985-01-01')],
+        images=[('1', 'us.jpg', 'Box - Front', 'North America'), ('1', 'es.jpg', 'Box - Front', 'Spain')]))
+    p = LaunchBoxProvider(tmp_path / 'cache', region='us')
+    result = p.find(game(tmp_path, 'Alien 8 (1985)(Ultimate Play The Game)(' + tag + ')', 'zxspectrum'), lambda: None)
+    assert result and result.region == expected
+    p.close()
+
+
+@pytest.mark.parametrize('tosec_date', ['1985-06', '1985-xx', '1985-xx-xx'])
+def test_tosec_valid_partial_date_can_corroborate_its_exact_known_year(tmp_path, transport, tosec_date):
+    transport[0].append(catalogue(games=[
+        ('1', 'Alien 8', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '', '1985')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    result = p.find(game(tmp_path, 'Alien 8 (' + tosec_date + ')(Ultimate Play The Game)', 'zxspectrum'), lambda: None)
+    assert result and result.provider_game_id == '1'
+    p.close()

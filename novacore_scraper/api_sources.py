@@ -229,13 +229,14 @@ class _APIProvider(_Provider):
 
     def _select(self, records, platform_id, game, checkpoint):
         matches = {}
+        platforms = set(platform_id if isinstance(platform_id, tuple) else (platform_id,))
         wanted = requested_info(game)
         # API aliases identify a game; physical cover regions are ranked below.
         # A canonical title with no region tag can still have a proven EU cover.
         identity_policy = MatchPolicy(allow_other_regions=True,
                                       allow_base_cover=self.match_policy.allow_base_cover)
         for row in records:
-            if platform_id not in row.get('platforms', []):
+            if platforms.isdisjoint(row.get('platforms', [])):
                 continue
             canonical = title_info(row['names'][0])
             if canonical.qualifiers != wanted.qualifiers and canonical.key != wanted.key:
@@ -272,17 +273,21 @@ class _APIProvider(_Provider):
             yield Artwork(url, self.name, region, match_note=note,
                           matched_title=matched.name, provider_game_id=str(row['id']))
 
+    def _platform(self, game):
+        return _platform_id(self._platforms, game)
+
     def candidates(self, game: Game, checkpoint: Checkpoint):
         """Rank every eligible cover only after the complete search proves identity."""
         self.prepare(checkpoint)
-        platform_id = _platform_id(self._platforms, game)
+        platform_id = self._platform(game)
         if platform_id is None:
             self._unmatched('unsupported_platform', 'The API has no unambiguous match for this platform.')
             return None
         query = requested_info(game).title
         if not query or len(query) > 4096:
             return None
-        records = self._cached('search:' + str(platform_id) + ':' + query,
+        identity = ','.join(map(str, platform_id)) if isinstance(platform_id, tuple) else str(platform_id)
+        records = self._cached('search:' + identity + ':' + query,
                                lambda: self._search(platform_id, query, checkpoint), checkpoint)
         yield from self._select(records, platform_id, game, checkpoint)
 
@@ -297,6 +302,12 @@ class _APIProvider(_Provider):
         with self._cache_lock:
             self._cache.clear()
         super().close()
+
+
+class _TheGamesDBAccessRefused(AuthenticationError):
+    """Latch unknown access refusals without claiming that a key is invalid."""
+    reason = 'access_refused'
+    retryable = False
 
 
 class TheGamesDBProvider(_APIProvider):
@@ -339,6 +350,23 @@ class TheGamesDBProvider(_APIProvider):
                         raise error
                     self._remaining -= 1
 
+    def _refused(self, data=None):
+        # Official AuthMiddleware uses 403 for exhausted allowance, while its
+        # status string misleadingly says "Invalid API key". Only validated
+        # allowance integers are evidence; never retain or display error text.
+        if isinstance(data, dict):
+            monthly, extra = data.get('remaining_monthly_allowance'), data.get('extra_allowance', 0)
+            if type(monthly) is int and monthly >= 0 and type(extra) is int and extra >= 0:
+                remaining = monthly + extra
+                with self._quota_lock:
+                    self._reported_remaining = remaining
+                    self._remaining = remaining if self._remaining is None else min(self._remaining, remaining)
+                if remaining == 0:
+                    # Public cover URLs and paid-for responses remain usable.
+                    raise QuotaError('TheGamesDB reports that the API allowance is exhausted. Resume after it resets.')
+        self._stop(_TheGamesDBAccessRefused,
+                   'TheGamesDB refused access. The response does not establish whether this is an account or allowance restriction.')
+
     def _json(self, endpoint, checkpoint, **params):
         self._local.tgdb_api = True
         try:
@@ -347,15 +375,25 @@ class TheGamesDBProvider(_APIProvider):
         finally:
             self._local.tgdb_api = False
         status = response.status_code
-        if status in (401, 403):
+        if status == 401:
             self._read(response, checkpoint, MAX_TEXT_BYTES)
-            self._stop(AuthenticationError, 'TheGamesDB refused access. Check your API key and API allowance.')
+            self._stop(AuthenticationError, 'TheGamesDB rejected the API key. Check your own API credentials.')
+        if status == 403:
+            try:
+                data = self._json_response(response, checkpoint)
+            except AuthenticationError:
+                raise
+            except ProviderError:
+                self._refused()
+            self._refused(data)
         data = self._json_response(response, checkpoint)
         if not isinstance(data, dict):
             raise ProviderError('TheGamesDB returned invalid catalog data.')
         code = data.get('code', 200)
-        if code in (401, 403):
-            self._stop(AuthenticationError, 'TheGamesDB refused access. Check your API key and API allowance.')
+        if code == 401:
+            self._stop(AuthenticationError, 'TheGamesDB rejected the API key. Check your own API credentials.')
+        if code == 403:
+            self._refused(data)
         if code != 200 or not isinstance(data.get('data'), dict):
             raise ProviderError('TheGamesDB returned invalid catalog data.')
         try:
@@ -477,6 +515,24 @@ class IGDBProvider(_APIProvider):
     def _trusted_host(self, host):
         return host in {'api.igdb.com', 'images.igdb.com', 'id.twitch.tv'}
 
+    def _platform(self, game):
+        system = game.system.name.casefold()
+        if _SYSTEM_EQUIVALENTS.get(system, system) != 'nes':
+            return super()._platform(game)
+        # IGDB separately catalogues these regional versions of one machine.
+        # Match only their canonical identities, excluding FDS and clone aliases.
+        canonical = {'nintendoentertainmentsystem': 'nes', 'nes': 'nes',
+                     'familycomputer': 'famicom', 'famicom': 'famicom'}
+        identities = {'nes': set(), 'famicom': set()}
+        for row in self._platforms:
+            identity = canonical.get(title_key(row['names'][0]))
+            if identity is not None:
+                identities[identity].add(row['id'])
+        if any(len(ids) > 1 for ids in identities.values()):
+            return None
+        scope = sorted(set().union(*identities.values()))
+        return (tuple(scope) if len(scope) > 1 else scope[0]) if scope else None
+
     def _token(self, checkpoint, rejected=None):
         while not self._token_lock.acquire(timeout=.1):
             checkpoint()
@@ -573,10 +629,12 @@ class IGDBProvider(_APIProvider):
 
     def _search(self, platform_id, query, checkpoint):
         records = {}
+        platform_filter = ('(' + ','.join(map(str, platform_id)) + ')'
+                           if isinstance(platform_id, tuple) else str(platform_id))
         for page in range(_PAGE_LIMIT):
             body = ('search ' + json.dumps(query) + '; fields name,alternative_names.name,platforms,cover.image_id,cover.animated,'
                     'game_localizations.name,game_localizations.cover.image_id,game_localizations.cover.animated,'
-                    'game_localizations.region.name,game_localizations.region.identifier,game_localizations.region.category; where platforms = ' + str(platform_id) +
+                    'game_localizations.region.name,game_localizations.region.identifier,game_localizations.region.category; where platforms = ' + platform_filter +
                     '; limit 50; offset ' + str(page * 50) + ';')
             rows = self._json('games', body, checkpoint)
             for row in rows:

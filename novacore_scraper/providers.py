@@ -29,7 +29,7 @@ from PIL import Image, UnidentifiedImageError
 
 from .models import Artwork, Game
 from .matching import (MatchPolicy, match_note, match_title, match_titles, region_key, region_rank,
-                       requested_info, title_info)
+                       requested_info, requested_title_variants, title_info)
 
 Checkpoint = Callable[[], None]
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -587,17 +587,24 @@ class LibretroProvider(_Provider):
                     bases.setdefault(_name_info(name)[0], []).append(name)
                 self._indexes[platform] = bases
             bases = self._indexes[platform]
-        requested = requested_info(game)
-        candidates = bases.get(requested.key, [])
         found = False
-        for match in match_titles(candidates, game, self.match_policy, self.region):
-            checkpoint()
-            found = True
-            yield Artwork('https://thumbnails.libretro.com/' + quote(platform, safe='') + '/Named_Boxarts/' + quote(match.name + '.png', safe=''),
-                          'Libretro', match.region, match_note=match.note, matched_title=match.name)
+        has_candidates = False
+        seen = set()
+        for variant in requested_title_variants(game):
+            candidates = bases.get(variant.info.key, [])
+            has_candidates |= bool(candidates)
+            for match in match_titles(candidates, game, self.match_policy, self.region, requested=variant.info):
+                checkpoint()
+                if match.name in seen:
+                    continue
+                seen.add(match.name)
+                found = True
+                note = ' '.join(value for value in (match.note, variant.note) if value)
+                yield Artwork('https://thumbnails.libretro.com/' + quote(platform, safe='') + '/Named_Boxarts/' + quote(match.name + '.png', safe=''),
+                              'Libretro', match.region, match_note=note, matched_title=match.name)
         if not found:
-            code = 'cover_policy' if candidates else 'no_title_match'
-            self._unmatched(code, 'No exact title cover satisfies the selected region and revision policy.' if candidates
+            code = 'cover_policy' if has_candidates else 'no_title_match'
+            self._unmatched(code, 'No exact title cover satisfies the selected region and revision policy.' if has_candidates
                             else 'No exact title appears in the Libretro catalogue for this platform.')
             return None
 

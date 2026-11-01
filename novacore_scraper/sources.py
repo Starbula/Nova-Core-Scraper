@@ -31,6 +31,8 @@ def safe_detail(value, fallback='The artwork source could not complete this requ
 def error_diagnostic(error):
     """A narrow retry policy: malformed data and local I/O need review, not loops."""
     if isinstance(error, AuthenticationError):
+        if getattr(error, 'reason', '') == 'access_refused':
+            return 'access_refused', safe_detail(error), False
         return 'authentication', 'The source credentials are missing or were rejected.', False
     if isinstance(error, QuotaError):
         if getattr(error, 'reason', '') == 'allowance_unconfirmed':
@@ -181,7 +183,7 @@ class FallbackProvider:
         with self._lock:
             identifier = id(provider)
             previous = self._errors.get(identifier)
-            severity = {'authentication': 3, 'quota_exhausted': 2, 'allowance_unconfirmed': 1}
+            severity = {'authentication': 3, 'access_refused': 3, 'quota_exhausted': 2, 'allowance_unconfirmed': 1}
             preserve = (identifier in self._disabled and previous is not None
                         and severity.get(previous[0], 0) > severity.get(info[0], 0))
             if not preserve:

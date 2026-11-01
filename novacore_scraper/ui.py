@@ -62,6 +62,7 @@ SOURCE_STATES = {'waiting': 'Waiting', 'preparing': 'Preparing', 'prepared': 'Pr
                  'searching': 'Searching', 'no_match': 'No match', 'matched': 'Matched',
                  'downloaded': 'Downloaded', 'quota_exhausted': 'Quota exhausted',
                  'authentication': 'Authentication rejected', 'temporary_failure': 'Temporary failure',
+                 'access_refused': 'Access refused',
                  'source_failure': 'Source failure', 'invalid_response': 'Invalid response',
                  'local_error': 'Local error', 'no_artwork': 'No front cover',
                  'allowance_unconfirmed': 'Budget unconfirmed'}

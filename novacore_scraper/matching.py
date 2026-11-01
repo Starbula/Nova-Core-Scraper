@@ -31,6 +31,12 @@ class TitleInfo:
 
 
 @dataclass(frozen=True)
+class RequestedTitleVariant:
+    info: TitleInfo
+    note: str = ''
+
+
+@dataclass(frozen=True)
 class TitleMatch:
     name: str
     region: str
@@ -53,6 +59,8 @@ _PACKAGING = re.compile(
     r'(?:rev(?:ision)?\.?\s*(?:\d+(?:[.\-_]\d+)*[a-z]?|[a-z])'
     r'|(?:v|ver\.?|version)\s*\d+(?:[.\-_]\d+)*[a-z]?'
     r'|(?:disc|disk|cd)\s*\d+(?:\s+of\s+\d+)?)', re.IGNORECASE)
+_NUMBERED_ARCHIVE_SYSTEMS = frozenset({'gb', 'gbc', 'gba', 'nds'})
+_ARCHIVE_NUMBER = re.compile(r'^[0-9]{4}[ \t]+-[ \t]+(?=\S)')
 
 
 def _normal(text: str) -> str:
@@ -112,10 +120,55 @@ def title_info(text: str) -> TitleInfo:
 
 def requested_info(game: Game) -> TitleInfo:
     """File metadata may add constraints that a shorter display title omitted."""
-    display, filename = title_info(game.title), title_info(game.path.stem)
+    display_name, file_name = game.title, game.path.stem
+    if game.system.name.casefold() in _NUMBERED_ARCHIVE_SYSTEMS:
+        # Handheld numbered archives use "0001 - Title". This is request-only
+        # metadata; canonical provider names and actual numeric titles retain
+        # every digit. Region, revision and meaningful tags are parsed below.
+        display_name = _ARCHIVE_NUMBER.sub('', display_name, count=1)
+        file_name = _ARCHIVE_NUMBER.sub('', file_name, count=1)
+    display, filename = title_info(display_name), title_info(file_name)
     identity = filename if filename.qualifiers and filename.qualifiers != display.qualifiers else display
     return TitleInfo(identity.key, filename.regions or display.regions,
                      identity.qualifiers, filename.packaging or display.packaging, identity.title)
+
+
+def computer_title_info(text: str, system: str) -> TitleInfo:
+    """Keep exact title identity while interpreting strict TOSEC languages."""
+    from .computer_titles import computer_region_title
+
+    info = title_info(text)
+    region_title = computer_region_title(text, system)
+    return info if region_title == text else TitleInfo(
+        info.key, title_info(region_title).regions, info.qualifiers, info.packaging, info.title)
+
+
+def requested_title_variants(game: Game) -> tuple[RequestedTitleVariant, ...]:
+    """Keep the exact request first, then a publisher-preserving computer form.
+
+    Select the source through the same filename qualifier guard before parsing
+    TOSEC metadata. A clean display name cannot erase a hacked ROM filename.
+    These variants never remove a publisher for a generic provider lookup.
+    """
+    from .computer_titles import parse_computer_title
+
+    original = requested_info(game)
+    display, filename = title_info(game.title), title_info(game.path.stem)
+    source = game.path.stem if filename.qualifiers and filename.qualifiers != display.qualifiers else game.title
+    parsed = parse_computer_title(source, game.system.name)
+    if parsed is not None:
+        file_regions = computer_title_info(game.path.stem, game.system.name).regions
+        display_regions = computer_title_info(game.title, game.system.name).regions
+        original = TitleInfo(original.key, file_regions or display_regions, original.qualifiers,
+                             original.packaging, original.title)
+    variants = [RequestedTitleVariant(original)]
+    if parsed is not None:
+        normalized = title_info(parsed.title)
+        info = TitleInfo(normalized.key, original.regions, normalized.qualifiers,
+                         original.packaging or normalized.packaging, normalized.title)
+        if info != original:
+            variants.append(RequestedTitleVariant(info, parsed.note))
+    return tuple(variants)
 
 
 def region_rank(region: str, explicit_regions: Iterable[str], preference: str,
@@ -147,13 +200,13 @@ def match_note(requested: TitleInfo, candidate: TitleInfo, region: str) -> str:
 
 
 def match_titles(candidate_names: Iterable[str], game: Game, policy: MatchPolicy | None = None,
-                 preference: str = 'eu') -> Iterable[TitleMatch]:
+                 preference: str = 'eu', *, requested: TitleInfo | None = None) -> Iterable[TitleMatch]:
     """Yield ranked variants of one exact title, never a similar title."""
     policy = policy or MatchPolicy()
-    requested = requested_info(game)
+    requested = requested or requested_info(game)
     choices = []
     for name in dict.fromkeys(candidate_names):
-        candidate = title_info(name)
+        candidate = computer_title_info(name, game.system.name)
         if candidate.key != requested.key:
             continue
         if not policy.allow_base_cover and candidate.packaging != requested.packaging:
