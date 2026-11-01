@@ -2,6 +2,7 @@ import tempfile
 import sqlite3
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from novacore_scraper.models import System, Game
 from novacore_scraper.state import State, InstallationLock
@@ -103,7 +104,7 @@ class StateTests(unittest.TestCase):
         directory = self.root/'.novacore-artwork'
         directory.mkdir()
         db_path = directory/'state.sqlite3'
-        with sqlite3.connect(db_path) as db:
+        with closing(sqlite3.connect(db_path)) as db, db:
             db.execute('''CREATE TABLE jobs (
                 key TEXT PRIMARY KEY, system_name TEXT NOT NULL, system_path TEXT NOT NULL,
                 relative_path TEXT NOT NULL, status TEXT NOT NULL, artwork TEXT,
