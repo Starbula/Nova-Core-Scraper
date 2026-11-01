@@ -12,18 +12,128 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .engine import ScrapeEngine
-from .library import detect_installations, discover_systems, scan_system, validate_retrobat
+from .library import detect_installations
+from .scan import scan_library
 from .models import Game, System
 from .providers import LibretroProvider, ScreenScraperProvider
 from .settings import Settings, data_directory, load_settings, save_settings
 
 LOG = logging.getLogger(__name__)
+DARK_COLORS = {
+    'background': '#181c22',
+    'surface': '#232a33',
+    'field': '#12171e',
+    'foreground': '#edf2f7',
+    'button': '#313c49',
+    'hover': '#405166',
+    'disabled_background': '#272f39',
+    'disabled_foreground': '#b1bdcc',
+    'border': '#536173',
+    'accent': '#8cbcff',
+    'selection': '#285880',
+    'selection_foreground': '#ffffff',
+}
 _CREDENTIALS = (
     ('devid', 'Developer ID', 'NOVACORE_SS_DEVID'),
     ('devpassword', 'Developer password', 'NOVACORE_SS_DEVPASSWORD'),
     ('username', 'Account username', 'NOVACORE_SS_USERNAME'),
     ('password', 'Account password', 'NOVACORE_SS_PASSWORD'),
 )
+
+
+def _dark_window(window: tk.Tk | tk.Toplevel) -> None:
+    window.configure(background=DARK_COLORS['background'])
+    if os.name != 'nt':
+        return
+
+    def titlebar():
+        # Windows 10/11 may support either attribute; older versions retain their title bar.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            get_parent = ctypes.windll.user32.GetParent
+            get_parent.argtypes = (wintypes.HWND,)
+            get_parent.restype = wintypes.HWND
+            hwnd = get_parent(window.winfo_id()) or window.winfo_id()
+            set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+            set_attribute.argtypes = (wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD)
+            set_attribute.restype = ctypes.c_long
+            enabled = ctypes.c_int(1)
+            for attribute in (20, 19):
+                if set_attribute(hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)) >= 0:
+                    break
+        except (AttributeError, OSError, tk.TclError):
+            pass
+
+    window.after_idle(titlebar)
+
+
+def apply_dark_theme(root: tk.Tk) -> ttk.Style:
+    """Use drawable ttk controls so Windows native colors cannot hide dark text."""
+    c = DARK_COLORS
+    style = ttk.Style(root)
+    style.theme_use('clam')
+    style.configure('.', background=c['background'], foreground=c['foreground'],
+                    bordercolor=c['border'], lightcolor=c['surface'], darkcolor=c['field'],
+                    troughcolor=c['field'], focuscolor=c['accent'],
+                    selectbackground=c['selection'], selectforeground=c['selection_foreground'])
+    style.map('.', background=[('disabled', c['disabled_background']), ('active', c['surface'])],
+              foreground=[('disabled', c['disabled_foreground'])],
+              selectbackground=[('!focus', c['selection'])],
+              selectforeground=[('!focus', c['selection_foreground'])])
+    for name in ('TFrame', 'TLabel', 'TLabelframe', 'TLabelframe.Label'):
+        style.configure(name, background=c['background'], foreground=c['foreground'])
+    style.configure('TButton', background=c['button'], foreground=c['foreground'],
+                    lightcolor=c['button'], darkcolor=c['button'])
+    style.map('TButton', background=[('disabled', c['disabled_background']),
+                                    ('pressed', c['surface']), ('active', c['hover'])],
+              foreground=[('disabled', c['disabled_foreground'])],
+              lightcolor=[('pressed', c['surface'])], darkcolor=[('pressed', c['surface'])],
+              bordercolor=[('focus', c['accent'])])
+    for name in ('TEntry', 'TSpinbox', 'TCombobox'):
+        style.configure(name, foreground=c['foreground'], background=c['surface'],
+                        fieldbackground=c['field'], insertcolor=c['foreground'],
+                        arrowcolor=c['foreground'], lightcolor=c['border'], darkcolor=c['border'],
+                        selectbackground=c['selection'], selectforeground=c['selection_foreground'])
+        style.map(name, foreground=[('disabled', c['disabled_foreground']), ('readonly', c['foreground'])],
+                  fieldbackground=[('disabled', c['disabled_background']), ('readonly', c['field'])],
+                  background=[('disabled', c['disabled_background']), ('pressed', c['hover']),
+                              ('active', c['hover']), ('readonly', c['surface'])],
+                  arrowcolor=[('disabled', c['disabled_foreground'])],
+                  bordercolor=[('focus', c['accent'])], lightcolor=[('focus', c['accent'])])
+    style.configure('TCheckbutton', background=c['background'], foreground=c['foreground'],
+                    indicatorbackground=c['field'], indicatorforeground=c['foreground'])
+    style.map('TCheckbutton', background=[('disabled', c['background']), ('active', c['background'])],
+              foreground=[('disabled', c['disabled_foreground'])],
+              indicatorbackground=[('disabled', c['disabled_background']), ('pressed', c['surface'])],
+              indicatorforeground=[('disabled', c['disabled_foreground'])])
+    style.configure('Treeview', background=c['field'], fieldbackground=c['field'],
+                    stripedbackground=c['surface'], foreground=c['foreground'])
+    style.map('Treeview', background=[('disabled', c['disabled_background']),
+                                     ('selected', c['selection'])],
+              foreground=[('disabled', c['disabled_foreground']),
+                          ('selected', c['selection_foreground'])],
+              bordercolor=[('focus', c['accent'])])
+    style.configure('Treeview.Heading', background=c['surface'], foreground=c['foreground'],
+                    lightcolor=c['surface'], darkcolor=c['surface'])
+    style.map('Treeview.Heading', background=[('active', c['hover']), ('pressed', c['button'])],
+              foreground=[('disabled', c['disabled_foreground'])])
+    style.configure('TScrollbar', background=c['button'], troughcolor=c['field'],
+                    arrowcolor=c['foreground'], lightcolor=c['button'], darkcolor=c['button'])
+    style.map('TScrollbar', background=[('disabled', c['disabled_background']),
+                                       ('pressed', c['selection']), ('active', c['hover'])],
+              arrowcolor=[('disabled', c['disabled_foreground'])])
+    style.configure('TProgressbar', background=c['accent'], troughcolor=c['field'],
+                    lightcolor=c['accent'], darkcolor=c['accent'])
+    style.configure('TSeparator', background=c['border'])
+    style.configure('ComboboxPopdownFrame', background=c['field'], bordercolor=c['border'])
+    # The combobox popup is a classic Tk Listbox rather than a ttk widget.
+    for option, value in (('background', c['field']), ('foreground', c['foreground']),
+                          ('selectBackground', c['selection']), ('selectForeground', c['selection_foreground']),
+                          ('highlightBackground', c['border']), ('highlightColor', c['accent'])):
+        root.option_add(f'*Listbox.{option}', value)
+    _dark_window(root)
+    return style
 
 
 class ConsoleSelection:
@@ -72,6 +182,7 @@ class App:
 
     def __init__(self, root: tk.Tk):
         self.root = root
+        self.style = apply_dark_theme(root)
         self.settings = load_settings()
         self.credentials = {key: os.environ.get(env, '') for key, _label, env in _CREDENTIALS}
         self.retrobat_root: Path | None = None
@@ -312,7 +423,7 @@ class App:
         extra = [Path(preferred)] if preferred else []
         self.status_var.set('Looking for RetroBat in common installation folders…')
         self.state_var.set('Detecting')
-        self._run_background('detect', lambda: detect_installations(extra))
+        self._run_background('detect', lambda: detect_installations(extra, first_only=True, cancelled=self._cancel_scan.is_set))
 
     def scan(self) -> None:
         if self.retrobat_root and not self.busy and not self._closing:
@@ -339,21 +450,11 @@ class App:
         self.progress_var.set('0 / 0')
         cancelled = self._cancel_scan.is_set
 
-        def work():
-            root = validate_retrobat(folder)
-            systems = discover_systems(root)
-            scanned = {}
-            for index, system in enumerate(systems):
-                if cancelled():
-                    return None
-                with self._scan_lock:
-                    self._latest_scan = (index, len(systems), system.fullname)
-                scanned[system.name] = scan_system(system, cancelled=cancelled)
-                with self._scan_lock:
-                    self._latest_scan = (index+1, len(systems), system.fullname)
-            return None if cancelled() else (root, systems, scanned)
+        def progress(done, total, name):
+            with self._scan_lock:
+                self._latest_scan = (done, total, name)
 
-        self._run_background('scan', work)
+        self._run_background('scan', lambda: scan_library(folder, cancelled=cancelled, progress=progress))
 
     def _make_provider(self):
         cache = data_directory() / 'cache'
@@ -512,6 +613,7 @@ class App:
         if self.busy or self._closing or self._settings_window:
             return
         window = self._settings_window = tk.Toplevel(self.root)
+        _dark_window(window)
         window.title('NovaCore settings')
         window.transient(self.root)
         window.resizable(False, False)

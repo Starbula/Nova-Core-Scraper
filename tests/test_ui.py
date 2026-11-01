@@ -9,7 +9,7 @@ import tkinter as tk
 import unittest
 from unittest.mock import patch
 
-from novacore_scraper import ui
+from novacore_scraper import ui, scan as scan_module
 from novacore_scraper.engine import Progress
 from novacore_scraper.models import Game, System
 from novacore_scraper.settings import Settings
@@ -19,6 +19,33 @@ def systems(root=Path('/fixture')):
     return [System('nes', 'Nintendo Entertainment System', root/'nes', frozenset({'.nes'})),
             System('snes', 'Super Nintendo', root/'snes', frozenset({'.sfc'})),
             System('psx', 'Sony PlayStation', root/'psx', frozenset({'.cue'}))]
+
+
+def luminance(color):
+    channels = [int(color[index:index+2], 16) / 255 for index in (1, 3, 5)]
+    channels = [value / 12.92 if value <= .04045 else ((value+.055)/1.055)**2.4
+                for value in channels]
+    return sum(value * weight for value, weight in zip(channels, (.2126, .7152, .0722)))
+
+
+def contrast(foreground, background):
+    high, low = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (high+.05) / (low+.05)
+
+
+class DarkThemeTests(unittest.TestCase):
+    def test_dark_palette_keeps_text_readable_in_selected_and_disabled_states(self):
+        colors = getattr(ui, 'DARK_COLORS', {})
+        required = {'background', 'surface', 'field', 'foreground', 'button', 'hover',
+                    'disabled_background', 'disabled_foreground', 'selection', 'selection_foreground', 'accent'}
+        self.assertTrue(required <= colors.keys(), 'The app needs an explicit dark control palette.')
+        for background in ('background', 'surface', 'field', 'button', 'hover'):
+            with self.subTest(background=background):
+                self.assertLess(luminance(colors[background]), .12)
+                self.assertGreaterEqual(contrast(colors['foreground'], colors[background]), 4.5)
+        self.assertGreaterEqual(contrast(colors['disabled_foreground'], colors['disabled_background']), 4.5)
+        self.assertGreaterEqual(contrast(colors['selection_foreground'], colors['selection']), 4.5)
+        self.assertGreaterEqual(contrast(colors['accent'], colors['field']), 3)
 
 
 class ConsoleSelectionTests(unittest.TestCase):
@@ -77,6 +104,25 @@ class ConsoleSelectionTests(unittest.TestCase):
         self.assertEqual(refresh_threads, [owner])
         self.assertEqual(app._events.get_nowait(), (1, 'scan', 'scanned', None))
 
+    def test_autodetect_uses_first_match_and_exposes_cancellation(self):
+        from types import SimpleNamespace
+        app = ui.App.__new__(ui.App)
+        app._worker_kind = ''
+        app.engine = None
+        app._closing = False
+        app._settings_window = None
+        app._cancel_scan = threading.Event()
+        app.folder_var = SimpleNamespace(get=lambda: '/fixture')
+        app.status_var = app.state_var = SimpleNamespace(set=lambda value: None)
+        app._run_background = lambda kind, operation: operation()
+        with patch.object(ui, 'detect_installations', return_value=[]) as detect:
+            app.autodetect()
+        self.assertTrue(detect.call_args.kwargs.get('first_only'))
+        checkpoint = detect.call_args.kwargs['cancelled']
+        self.assertFalse(checkpoint())
+        app._cancel_scan.set()
+        self.assertTrue(checkpoint())
+
     def test_result_mailbox_is_bounded_and_retains_latest_result(self):
         app = ui.App.__new__(ui.App)
         app._events = queue.Queue(maxsize=4)
@@ -115,6 +161,56 @@ class TkTests(unittest.TestCase):
             time.sleep(.005)
         self.fail('Timed out waiting for the Tk event loop.')
 
+    def assert_readable_colors(self, foreground, background):
+        self.assertTrue(foreground, 'The foreground must be explicitly configured.')
+        self.assertTrue(background, 'The background must be explicitly configured.')
+
+        def hex_color(value):
+            return '#' + ''.join(f'{channel // 257:02x}' for channel in self.root.winfo_rgb(value))
+
+        foreground, background = hex_color(foreground), hex_color(background)
+        self.assertLess(luminance(background), .12)
+        self.assertGreaterEqual(contrast(foreground, background), 4.5)
+
+    def test_dark_styles_cover_normal_readonly_disabled_and_selected_controls(self):
+        style = ui.ttk.Style(self.root)
+        self.assertEqual(style.theme_use(), 'clam', 'Native Windows themes must not replace dark control colors.')
+        self.assertLess(luminance(self.root.cget('background')), .12)
+        cases = (
+            ('TLabel', (), 'background'), ('TButton', (), 'background'),
+            ('TButton', ('active',), 'background'), ('TButton', ('pressed',), 'background'),
+            ('TButton', ('disabled',), 'background'), ('TEntry', (), 'fieldbackground'),
+            ('TEntry', ('readonly',), 'fieldbackground'), ('TEntry', ('disabled',), 'fieldbackground'),
+            ('TSpinbox', (), 'fieldbackground'), ('TSpinbox', ('disabled',), 'fieldbackground'),
+            ('TCombobox', ('readonly',), 'fieldbackground'), ('TCombobox', ('disabled',), 'fieldbackground'),
+            ('Treeview', (), 'background'), ('Treeview', ('selected',), 'background'),
+            ('Treeview', ('disabled',), 'background'), ('Treeview.Heading', (), 'background'),
+            ('Treeview.Heading', ('active',), 'background'),
+            ('TCheckbutton', (), 'background'), ('TCheckbutton', ('disabled',), 'background'),
+        )
+        for name, state, background in cases:
+            with self.subTest(style=name, state=state):
+                self.assert_readable_colors(style.lookup(name, 'foreground', state),
+                                            style.lookup(name, background, state))
+
+    def test_settings_window_and_combobox_popup_use_dark_readable_colors(self):
+        self.app.show_settings()
+        window = self.app._settings_window
+        self.assertLess(luminance(window.cget('background')), .12)
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        combobox = next(widget for widget in descendants(window) if isinstance(widget, ui.ttk.Combobox))
+        popup = str(self.root.tk.call('ttk::combobox::PopdownWindow', str(combobox)))
+        listbox = popup + '.f.l'
+        self.assert_readable_colors(self.root.tk.call(listbox, 'cget', '-foreground'),
+                                    self.root.tk.call(listbox, 'cget', '-background'))
+        self.assert_readable_colors(self.root.tk.call(listbox, 'cget', '-selectforeground'),
+                                    self.root.tk.call(listbox, 'cget', '-selectbackground'))
+
     def test_filter_render_preserves_selection(self):
         self.app.selection.replace_systems(systems())
         self.app._render_systems()
@@ -147,9 +243,9 @@ class TkTests(unittest.TestCase):
             return [Game(system, system.path/'game.rom', 'game.rom', 'Game')]
 
         self.app._render_systems = render
-        with patch.object(ui, 'validate_retrobat', return_value=root), \
-             patch.object(ui, 'discover_systems', return_value=consoles), \
-             patch.object(ui, 'scan_system', side_effect=scan), \
+        with patch.object(scan_module, 'validate_retrobat', return_value=root), \
+             patch.object(scan_module, 'discover_systems', return_value=consoles), \
+             patch.object(scan_module, 'scan_system', side_effect=scan), \
              patch.object(ui, 'LibretroProvider'):
             self.app._begin_scan(root)
             self.assertTrue(self.app.browse_button.instate(['disabled']))

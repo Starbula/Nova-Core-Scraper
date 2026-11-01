@@ -1,6 +1,6 @@
 # NovaCore Artwork Scraper
 
-A portable Windows 10/11 desktop tool for filling in missing RetroBat box artwork. Choose a RetroBat installation and the systems you want to scan, then start scraping. The default Libretro provider needs no account.
+A portable Windows 10/11 desktop tool for filling in missing RetroBat box artwork. Choose a RetroBat installation and the systems you want to scan, then start scraping. The default Libretro provider needs no account. The desktop interface and Settings use a readable dark theme.
 
 Box artwork is the only supported media in this version. Manuals, ratings and pad-to-key are unavailable and disabled.
 
@@ -14,7 +14,7 @@ For source use, install Python 3.11 or newer with Tcl/Tk support, extract or clo
 2. Tick the consoles you want, or use **Select visible**. The console filter does not clear hidden selections. Keep Libretro selected unless you have your own ScreenScraper credentials.
 3. Click **Start scraping**. Use **Pause / Resume** or **Stop** as needed; starting again skips downloaded box artwork. Counts show downloaded, existing, missing, failed and queued metadata.
 
-The application reads the installation's system configuration where available and scans supported ROM files recursively. It honours existing artwork metadata and avoids linked directories. Ambiguous or unsupported library layouts may need manual artwork.
+The application reads the installation's system configuration where available and scans supported ROM files recursively. Scanning uses cached directory information, skips unrelated video/manual folders, and processes up to two consoles at a time. Autodetection stops as soon as it finds a valid installation. It honours existing artwork metadata and avoids linked directories. Ambiguous or unsupported library layouts may need manual artwork.
 
 ## Providers and matching
 

@@ -49,7 +49,6 @@ _COMMON = {
     'fbneo': ('FinalBurn Neo', '.zip .7z', '75'),
 }
 _IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
-_MEDIA_DIRECTORIES = frozenset({'images', 'downloaded_images', 'media', 'videos', 'manuals', 'marquees', '.novacore-artwork'})
 _MANIFEST_EXTENSIONS = frozenset({'.m3u', '.cue', '.gdi', '.ccd'})
 # Only image files are retained; a full ROM index is not kept between scans.
 _ARTWORK_SNAPSHOTS: OrderedDict[str, tuple[tuple[int, int], dict[str, Path]]] = OrderedDict()
@@ -115,7 +114,7 @@ def validate_retrobat(path: Path) -> Path:
         raise ValueError('Cannot read the selected RetroBat installation.') from exc
 
 
-def detect_installations(extra: Iterable[Path] = ()) -> list[Path]:
+def detect_installations(extra: Iterable[Path] = (), *, first_only: bool = False, cancelled: Callable[[], bool] = lambda: False) -> list[Path]:
     """Check explicit and common portable locations without a drive-wide search."""
     candidates = list(extra)
     candidates.extend(Path(value) for key in ('RETROBAT_HOME', 'RETROBAT_PATH') if (value := os.environ.get(key)))
@@ -125,6 +124,8 @@ def detect_installations(extra: Iterable[Path] = ()) -> list[Path]:
         candidates.extend(Path(value)/'RetroBat' for key in ('ProgramFiles', 'ProgramFiles(x86)') if (value := os.environ.get(key)))
     found, seen = [], set()
     for candidate in candidates:
+        if cancelled():
+            break
         try:
             root = validate_retrobat(candidate)
         except (ValueError, OSError):
@@ -133,6 +134,8 @@ def detect_installations(extra: Iterable[Path] = ()) -> list[Path]:
         if key not in seen:
             found.append(root)
             seen.add(key)
+            if first_only:
+                break
     return found
 
 
@@ -380,9 +383,19 @@ def _artwork_snapshot(root: Path) -> dict[str, Path] | None:
         return record[1]
 
 
-def _find_artwork(game: Game, images: Iterable[str], index: dict[str, Path] | None = None, *, live_destination: bool = False) -> Path | None:
+def _find_artwork(game: Game, images: Iterable[str], index: dict[str, Path] | None = None, *, live_destination: bool = False, fresh_index: bool = False) -> Path | None:
     # Fresh explicit XML takes priority over a former scan result.
     for raw in images:
+        # The current scan already checked these entries and their parents.
+        # Avoid rebuilding/inspecting the same path for every XML thumbnail.
+        relative = _relative(raw)
+        if index is not None and relative is not None:
+            known = index.get(relative.casefold())
+            if known is not None:
+                if fresh_index:
+                    return known
+                if (checked := _checked_artwork(known)) is not None:
+                    return checked
         path = _local_metadata_path(game.system.path, raw)
         if path is not None:
             if index is not None:
@@ -390,6 +403,13 @@ def _find_artwork(game: Game, images: Iterable[str], index: dict[str, Path] | No
                     path = index.get(path.relative_to(game.system.path).as_posix().casefold(), path)
                 except ValueError:
                     pass
+            if fresh_index and index is not None:
+                try:
+                    known = index.get(path.relative_to(game.system.path).as_posix().casefold())
+                except ValueError:
+                    known = None
+                if known is not None:
+                    return known
             checked = _checked_artwork(path)
             if checked is not None:
                 return checked
@@ -401,13 +421,18 @@ def _find_artwork(game: Game, images: Iterable[str], index: dict[str, Path] | No
     if index is None or live_destination:
         if (checked := _checked_artwork(destination)) is not None:
             return checked
-    elif destination.relative_to(game.system.path).as_posix().casefold() in index:
-        if (checked := _checked_artwork(destination)) is not None:
+    elif (known := index.get(destination.relative_to(game.system.path).as_posix().casefold())) is not None:
+        if fresh_index:
+            return known
+        if (checked := _checked_artwork(known)) is not None:
             return checked
     for relative in _artwork_candidates(game):
         path = index.get(relative.casefold()) if index is not None else game.system.path/relative
-        if path is not None and (checked := _checked_artwork(path)) is not None:
-            return checked
+        if path is not None:
+            if fresh_index:
+                return path
+            if (checked := _checked_artwork(path)) is not None:
+                return checked
     return None
 
 
@@ -468,60 +493,106 @@ def _manifest_references(path: Path) -> list[str]:
         return []
 
 
+def _entry_linked(entry: os.DirEntry) -> bool:
+    if entry.is_symlink():
+        return True
+    # Windows supplies these attributes in scandir's cached find information.
+    # POSIX d_type handles links without adding a stat for every regular file.
+    if os.name == 'nt':
+        info = entry.stat(follow_symlinks=False)
+        return bool(getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+    return False
+
+
 def scan_system(system: System, cancelled: Callable[[], bool] = lambda: False) -> list[Game]:
-    """Scan each file once; suppress disc companions and folder-game contents."""
+    """Read each relevant directory once and retain its safe file information."""
     root = system.path
     if cancelled() or _has_link_ancestor(root) or not root.is_dir():
         return []
     metadata = _gamelist(root)
-    files, candidates = {}, {}
-    # Directory keys prune os.walk at each level without an all-games inner loop.
-    for directory, directories, filenames in os.walk(root, followlinks=False):
+    files: dict[str, Path] = {}
+    candidates: dict[str, tuple[Path, str]] = {}
+    manifests: list[tuple[Path, str]] = []
+    # kind is rom, images, or media (where only box2d is conventional artwork).
+    stack = [(root, '', 'rom')]
+    while stack:
         if cancelled():
             return []
-        parent = Path(directory)
-        relative_parent = parent.relative_to(root)
-        inside_media = any(part.casefold() in _MEDIA_DIRECTORIES for part in relative_parent.parts)
-        remaining = []
-        for name in directories:
-            path = parent/name
-            if _is_link(path) or name.startswith('.'):
-                continue
-            key = path.relative_to(root).as_posix().casefold()
-            if not inside_media and (key in metadata or path.suffix.casefold() in system.extensions):
-                candidates[key] = path
-            else:
-                remaining.append(name)
-        directories[:] = remaining
-        for name in filenames:
-            if cancelled():
-                return []
-            path = parent/name
-            if _is_link(path) or not path.is_file():
-                continue
-            key = path.relative_to(root).as_posix().casefold()
-            files[key] = path
-            if not inside_media and not name.startswith('.') and path.suffix.casefold() in system.extensions:
-                candidates[key] = path
+        directory, prefix, kind = stack.pop()
+        # A removable drive or another process may replace a queued directory.
+        # Recheck only directory ancestry, never every indexed file's ancestry.
+        if _has_link_ancestor(directory):
+            continue
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if cancelled():
+                        return []
+                    name = entry.name
+                    if name.startswith('.'):
+                        continue
+                    folded = name.casefold()
+                    relative = prefix + name
+                    key = relative.casefold()
+                    extension = '.' + folded.rsplit('.', 1)[1] if '.' in folded else ''
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if _entry_linked(entry):
+                                continue
+                            if kind == 'rom' and (key in metadata or extension in system.extensions):
+                                candidates[key] = (Path(entry.path), relative)
+                                continue
+                            if kind == 'media':
+                                if folded != 'box2d':
+                                    continue
+                                next_kind = 'images'
+                            elif folded in {'videos', 'manuals', 'marquees'}:
+                                continue
+                            elif folded == 'media':
+                                next_kind = 'media'
+                            elif kind == 'images' or folded in {'images', 'downloaded_images'}:
+                                next_kind = 'images'
+                            else:
+                                next_kind = 'rom'
+                            stack.append((Path(entry.path), relative + '/', next_kind))
+                            continue
+                        if kind == 'media':
+                            continue
+                        if kind == 'images':
+                            relevant = extension in _IMAGE_EXTENSIONS
+                        else:
+                            relevant = extension in system.extensions or extension in _MANIFEST_EXTENSIONS or extension in _IMAGE_EXTENSIONS
+                        if not relevant or not entry.is_file(follow_symlinks=False) or _entry_linked(entry):
+                            continue
+                    except OSError:
+                        # Unreadable or concurrently removed entries are not games.
+                        continue
+                    path = Path(entry.path)
+                    files[key] = path
+                    if kind == 'rom':
+                        if extension in system.extensions:
+                            candidates[key] = (path, relative)
+                        if extension in _MANIFEST_EXTENSIONS:
+                            manifests.append((path, relative))
+        except OSError:
+            continue
     referenced = set()
-    for path in files.values():
+    for path, relative in manifests:
         if cancelled():
             return []
-        if path.suffix.casefold() in _MANIFEST_EXTENSIONS:
-            parent = PurePosixPath(path.relative_to(root).as_posix()).parent
-            for raw in _manifest_references(path):
-                relative = _relative(raw, parent, parent=True)
-                if relative and relative.casefold() in files:
-                    referenced.add(relative.casefold())
+        parent = PurePosixPath(relative).parent
+        for raw in _manifest_references(path):
+            reference = _relative(raw, parent, parent=True)
+            if reference and reference.casefold() in files:
+                referenced.add(reference.casefold())
     games = []
-    for key, path in candidates.items():
+    for key, (path, relative) in candidates.items():
         if cancelled():
             return []
         if key in referenced:
             continue
-        relative = path.relative_to(root).as_posix()
         title, images = metadata.get(key, ('', []))
         game = Game(system, path, relative, title or path.stem)
-        games.append(Game(system, path, relative, game.title, _find_artwork(game, images, files)))
+        games.append(Game(system, path, relative, game.title, _find_artwork(game, images, files, fresh_index=True)))
     _remember_artwork(root, files)
     return sorted(games, key=lambda game: game.relative_path.casefold())

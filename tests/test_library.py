@@ -97,6 +97,118 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(systems[0].extensions, frozenset({'.nes', '.zip'}))
         self.assertEqual(systems[0].path, self.root/'roms'/'nes')
 
+    def test_autodetect_first_only_stops_after_first_valid_candidate(self):
+        later = self.root.parent/'other-retrobat'
+        attempted = []
+        original = library.validate_retrobat
+        def validate(path):
+            attempted.append(path)
+            if path == later:
+                self.fail('later drives must not be probed after finding the preferred installation')
+            return original(path)
+        with patch.object(library, 'validate_retrobat', validate):
+            self.assertEqual(library.detect_installations([self.root, later], first_only=True), [self.root])
+        self.assertEqual(attempted, [self.root])
+
+    def test_autodetect_cancellation_stops_before_candidate_validation(self):
+        with patch.object(library, 'validate_retrobat', side_effect=AssertionError('cancelled detection must not probe a drive')):
+            self.assertEqual(library.detect_installations([self.root], cancelled=lambda: True), [])
+
+    def test_scan_skips_unrelated_media_subtrees_but_honors_explicit_custom_thumbnail(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/A.sfc', 'rom')
+        self.write('roms/snes/videos/nested/ignored.mp4', 'video')
+        self.write('roms/snes/manuals/nested/ignored.pdf', 'manual')
+        self.write('roms/snes/media/screenshots/nested/A-image.png', 'screenshot')
+        box = self.write('roms/snes/manuals/custom/A.png', 'explicit custom box')
+        self.write('roms/snes/gamelist.xml', '<gameList><game><path>A.sfc</path><thumbnail>manuals/custom/A.png</thumbnail></game></gameList>')
+        original = os.scandir
+        forbidden = [system.path/'videos', system.path/'manuals', system.path/'media'/'screenshots']
+        def guarded(path):
+            if any(Path(path).is_relative_to(folder) for folder in forbidden):
+                self.fail('unrelated media subtree should not be enumerated: '+str(path))
+            return original(path)
+        with patch.object(os, 'scandir', guarded):
+            games = library.scan_system(system)
+        self.assertEqual([game.relative_path for game in games], ['A.sfc'])
+        self.assertEqual(games[0].existing_artwork, box)
+
+    def test_scan_uses_directory_file_information_and_checks_indexed_covers_once(self):
+        system = self.system('snes', ('.sfc',))
+        entries = []
+        for index in range(100):
+            self.write(f'roms/snes/Game {index}.sfc', 'rom')
+            self.write(f'roms/snes/images/Game {index}-thumb.png', 'box')
+            self.write(f'roms/snes/notes {index}.txt', 'irrelevant')
+            entries.append(f'<game><path>Game {index}.sfc</path><thumbnail>images/Game {index}-thumb.png</thumbnail></game>')
+        self.write('roms/snes/gamelist.xml', '<gameList>'+''.join(entries)+'</gameList>')
+        original = Path.stat
+        calls = []
+        def counted(path, *args, **kwargs):
+            calls.append(path)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'stat', counted):
+            games = library.scan_system(system)
+        self.assertEqual(len(games), 100)
+        self.assertTrue(all(game.existing_artwork is not None for game in games))
+        self.assertLess(len(calls), 50, 'freshly indexed ROMs and thumbnails should not each be restatted by Path')
+
+    def test_live_artwork_recheck_rejects_image_directory_replaced_by_link(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/A.sfc', 'rom')
+        box = self.write('roms/snes/images/A-thumb.png', 'box')
+        game = library.scan_system(system)[0]
+        self.assertEqual(game.existing_artwork, box)
+        outside = self.root.parent/'outside-covers'
+        outside.mkdir()
+        (outside/'A-thumb.png').write_text('external')
+        (system.path/'images').rename(system.path/'old-images')
+        try:
+            (system.path/'images').symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest('symlinks unavailable')
+        self.assertIsNone(library.existing_artwork(game))
+        self.assertEqual((outside/'A-thumb.png').read_text(), 'external')
+
+    def test_scan_cancels_during_directory_enumeration_without_partial_results(self):
+        system = self.system('snes', ('.sfc',))
+        for index in range(100):
+            self.write(f'roms/snes/Nested/Game {index}.sfc', 'rom')
+        checks = 0
+        def cancelled():
+            nonlocal checks
+            checks += 1
+            return checks >= 20
+        self.assertEqual(library.scan_system(system, cancelled=cancelled), [])
+        self.assertFalse((system.path/'images').exists())
+
+    def test_queued_directory_replaced_with_link_is_not_traversed(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/Nested/Local.sfc', 'rom')
+        outside = self.root.parent/'outside-roms'
+        outside.mkdir()
+        (outside/'External.sfc').write_text('rom')
+        probe = self.root.parent/'link-probe'
+        try:
+            probe.symlink_to(outside, target_is_directory=True)
+            probe.unlink()
+        except OSError:
+            self.skipTest('symlinks unavailable')
+        original = os.scandir
+        class SwapAfterListing:
+            def __init__(self, path):
+                self.path = Path(path)
+                self.iterator = original(path)
+            def __enter__(self):
+                return self.iterator
+            def __exit__(self, *args):
+                self.iterator.close()
+                if self.path == system.path:
+                    (system.path/'Nested').rename(system.path/'Old Nested')
+                    (system.path/'Nested').symlink_to(outside, target_is_directory=True)
+        with patch.object(os, 'scandir', SwapAfterListing):
+            self.assertEqual(library.scan_system(system), [])
+
     def test_fallback_only_includes_existing_common_system_directories(self):
         self.system('snes', ('.sfc',))
         self.system('psx')
