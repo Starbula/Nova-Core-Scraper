@@ -1,6 +1,6 @@
 # NovaCore Artwork Scraper
 
-A portable Windows 10/11 desktop tool for filling in missing RetroBat box artwork. Choose a RetroBat installation and the systems you want to scan, then start scraping. The default **Automatic** mode tries Libretro and then LaunchBox, without an account. The desktop interface and Settings use a readable dark theme.
+A portable Windows 10/11 desktop tool for filling in missing RetroBat box artwork. Select your consoles, click **Start scraping**, and leave the run working independently of RetroBat. **Automatic** tries every configured source, with account-free sources available immediately. The desktop interface and Settings use a readable dark theme.
 
 Box artwork is the only supported media in this version. Manuals, ratings and pad-to-key are unavailable and disabled.
 
@@ -14,6 +14,8 @@ For source use, install Python 3.11 or newer with Tcl/Tk support, extract or clo
 2. Choose a console from the dropdown or click its name. This selects **only that console**. Use the large checkbox column for several consoles, or the global **Select All / Deselect All** buttons. Every new session starts with no consoles selected, so an old bulk selection cannot silently queue the whole library.
 3. Check the selected console names, game count and missing-cover count above the list, then click **Start scraping**. The app switches to **Downloads** and freezes that run's console scope.
 
+For an unattended run, keep **Automatic**, **Retry temporary failures**, **Keep PC awake**, and both cover-fallback options enabled in Settings. Optional provider accounts can be configured once before starting. Start waits for remembered credentials to load so a quick click cannot silently omit saved sources. You can play games in RetroBat while NovaCore downloads; metadata is applied after RetroBat closes.
+
 Console coverage totals, the selected-game summary and Start button update as covers finish. You do not need to close the application or rescan to see its downloads reflected. Artwork changes made by other programs still require **Scan library**.
 
 The optional console search matches partial words regardless of spaces: `GameBoy`, `Game Boy`, `Game Advance` and `GBA` can find Game Boy Advance. Choosing a console hidden by a search clears that search and scrolls its row into view.
@@ -21,9 +23,9 @@ The optional console search matches partial words regardless of spaces: `GameBoy
 | Tab | Purpose |
 | --- | --- |
 | Library | Choose consoles and see games, existing covers and missing covers. |
-| Downloads | See each queued game's state, search/filter the queue, cancel selected games or cancel all, and pause/resume. |
+| Downloads | See each game's state, source, match notes and unresolved reason; filter, cancel, pause/resume, or export results to CSV. |
 | Downloaded | Inspect completed artwork and its saved path, including downloads from earlier sessions. |
-| Settings | Choose automatic fallback or a single provider, region, request limits and optional ScreenScraper account in the same window. |
+| Settings | Configure providers, credentials, matching, retries and power options in a scrollable form inside the same window. |
 
 Download tables show 200 rows per page, with Previous/Next controls, so large queues do not create tens of thousands of UI rows. Cancelling work keeps already completed artwork. The progress bar stays visible in every tab: first it shows selected-game checks, then missing-artwork jobs processed. Downloaded, existing, missing, failed and cancelled counts stay separate; 100% processed does not mean every game had a matching cover.
 
@@ -31,27 +33,68 @@ The application reads the installation's system configuration where available an
 
 ### Faster scraping
 
-Settings provides a **Fast preset** of 8 workers and 0.25 seconds between request starts, with up to 16 configurable workers. Libretro uses at most 8 active requests and a 0.25-second minimum spacing; LaunchBox uses at least 0.5-second spacing. These are NovaCore's traffic limits, and server responses or ScreenScraper account permissions can slow requests further. More workers help overlap network waits and image processing; they cannot guarantee a particular download rate.
+Settings provides a **Fast preset** of 8 workers and 0.25 seconds between request starts, with up to 16 configurable workers. Libretro caps active requests at 8, LaunchBox/GameTDB enforce at least 0.5-second spacing, IGDB enforces its 4-per-second/8-open-request limits, and MobyGames conservatively uses one request every 10 seconds. User settings, server responses and account quotas can slow requests further. More workers overlap network waits and image processing; they cannot guarantee a particular download rate.
 
 Catalogue lookups happen locally after caching. Recent validated image bytes are reused within a run, with a bounded 64 MiB cache per source: simultaneous ROM entries using the same cover share a request while each receives its own safely published artwork file. Existing files continue to prevent repeat downloads across sessions.
 
 Older default settings migrate to automatic sources and the fast defaults. Saved custom rates and worker counts are retained within the supported bounds; explicit choices saved by this version are preserved.
 
+Temporary source/network failures receive up to **two additional passes**, with a cooperative 30-second wait before each pass. Pause freezes the countdown; Stop and per-game cancellation interrupt it. Source cooldowns avoid repeating expensive calls to an offline service for every game. Missing matches, ambiguous titles, invalid images, rejected credentials and exhausted quotas are not blindly retried. Progress counts unique games rather than adding retries to the total.
+
+**Keep PC awake** prevents automatic Windows idle sleep during the run, including retry waits, while allowing the display to turn off. Normal power behavior is restored when the run ends. It does not prevent manual sleep, shutdown or a laptop lid action.
+
 ## Providers and matching
 
-**Automatic** tries Libretro, then LaunchBox when no match is found or an image cannot be downloaded. A broken source does not prevent a healthy source from succeeding. If a source fails and no other source succeeds, the app reports a failure instead of pretending every source returned no match. Source information appears in the current Downloads row.
+Seven provider adapters are supported. **Automatic** uses the three account-free adapters, then adds complete configured accounts. It tries safe regional/image alternatives within each source before giving up; a broken preferred image does not hide another listed cover for that same identified game. A failed source does not stop healthy fallback sources. Unsupported platforms are skipped, so GameTDB does not perform Wii catalogue work for a Game Boy run.
 
-**Libretro** uses the public [libretro-thumbnails collections](https://github.com/libretro-thumbnails/libretro-thumbnails) and `Named_Boxarts` images; see the [official thumbnail naming guide](https://docs.libretro.com/guides/roms-playlists-thumbnails/). Matching is deliberately conservative: a game title must match an available artwork title after the documented provider normalization. The app reports missing matches rather than selecting a similar title. A ROM filename, region label or custom game title that differs from the provider's naming may need a manual correction.
+| Source | Setup | Coverage notes |
+| --- | --- | --- |
+| Libretro | None | Public Named_Boxarts collections. |
+| LaunchBox | None | Public metadata catalogue and listed front covers. First catalogue download is about 110 MB. |
+| GameTDB | None | Verified Wii/GameCube catalogue or local disc-ID cover lookup. Other GameTDB platforms are not implemented. |
+| TheGamesDB | Your own API key | Platform-specific game records and front box images. |
+| IGDB | Your own Twitch application Client ID and Client Secret | Game covers and available regional localizations; physical packaging for a particular port is unverified and labelled. |
+| MobyGames | Your own subscription API key | Platform-specific front scans. **Data by MobyGames.com**. |
+| ScreenScraper | Authorized NovaCore application integration plus your user account | Existing API adapter; NovaCore still does not ship an approved application pair. |
+
+Availability in Settings distinguishes supported services from accounts ready for this run. There are no bundled or borrowed API credentials. Missing optional keys do not block the public sources.
+
+**Libretro** uses the public [libretro-thumbnails collections](https://github.com/libretro-thumbnails/libretro-thumbnails) and `Named_Boxarts`; see the [official naming guide](https://docs.libretro.com/guides/roms-playlists-thumbnails/). Catalogue lookups are cached and indexed locally.
 
 **LaunchBox** uses its [official public metadata export](https://gamesdb.launchbox-app.com/Metadata.zip) and front-box images listed in that catalogue. Its administrator [permits other applications to use the data](https://forums.launchbox-app.com/topic/30050-tips-and-suggestions-for-games-database/) and [documents using exported image filenames](https://forums.launchbox-app.com/topic/54163-is-there-a-public-way-to-get-images-from-the-launchbox-games-database/). No LaunchBox installation or account is needed. On first use, NovaCore downloads a catalogue of about 110 MB and builds a compact SQLite index in the background; preparation messages show download/index progress. The index is cached for seven days. A failed refresh retains a previously usable index, and an interrupted first preparation can be retried. Keep roughly 300 MB free in the app's data drive for catalogue preparation, in addition to your artwork storage.
 
-LaunchBox matching requires one exact normalized title or verified alternate name within the correct platform, then selects an appropriate front cover using the ROM's region and your preference. Conflicting game IDs remain unmatched. GoodTools region abbreviations such as `(U)`, `(E)` and `(JUE)`, and verified-good `[!]` markers, are recognized. Hacks, discs, revisions and unknown qualifiers stay distinct. Extra sources improve coverage but do not guarantee artwork for every ROM variant, translation or homebrew title. The application does not redistribute LaunchBox's artwork or claim ownership of it.
+Shared matching normalizes punctuation, spacing, case, Latin accents and trailing articles. GoodTools region abbreviations and verified-good `[!]` markers are recognized. This recovers names such as a dash versus a colon without using a partial-name or edit-distance guess. Digits, sequels, meaningful editions, hacks, demos, prototypes and unknown qualifiers remain part of identity; ambiguous game IDs are left for review.
+
+By default, an identified base game may supply a cover for a plain revision/version/disc variant, and another region's cover can be used if no preferred cover succeeds. The actual region and fallback note are recorded in results and history. Disable **Use base-game covers for revisions/discs** or **Use another-region covers for the same game** for strict matching. These options do not authorize assigning an unrelated game's artwork. Some covers and identifications remain unavailable; no source count can guarantee 100% of an arbitrary ROM collection.
+
+**GameTDB** uses its [public database and documented cover service](https://www.gametdb.com/Main/FAQ). Eligible local disc headers can identify an exact Wii/GameCube release without uploading ROM data. Public metadata access can be unavailable; verified header recovery remains independent of that catalogue. Compressed/container formats without a supported header reader require a catalogue title match. See [provider notes](docs/providers.md) for the exact supported formats and limitations.
+
+### Optional accounts, configured once
+
+Enter the relevant fields in Settings. [TheGamesDB key page](https://api.thegamesdb.net/key.php) requires your account login. [IGDB's setup instructions](https://api-docs.igdb.com/#account-creation) require a Twitch account with two-factor authentication, a registered Confidential application, its Client ID and generated Client Secret. [MobyGames API access](https://www.mobygames.com/api/subscribe/) requires your own subscription key. These services' setup requirements cannot be replaced by the scraper.
+
+On Windows, **Remember credentials for this Windows account** protects the values with DPAPI in `data/credentials.dat`; they are not written into `settings.json`. Uncheck it and Save to remove remembered values. Saved credentials normally require the same Windows account and computer; moving the portable app elsewhere may require re-entry. On other operating systems values stay in the current session. Provider tokens are not persisted. Environment variables override remembered values:
+
+```text
+NOVACORE_TGDB_API_KEY
+NOVACORE_IGDB_CLIENT_ID
+NOVACORE_IGDB_CLIENT_SECRET
+NOVACORE_MOBYGAMES_API_KEY
+NOVACORE_SS_USERNAME
+NOVACORE_SS_PASSWORD
+```
 
 **ScreenScraper** needs both a registered application integration and your personal account. Ordinary users enter only username and password in **Settings**. NovaCore does **not** ship an approved developer credential pair, so a personal login alone cannot currently enable this provider. Settings explains this upfront, and Start remains unavailable for an unconfigured ScreenScraper setup. Use the visible **Use automatic sources** button to scrape without an account.
 
-For maintainers configuring an authorized NovaCore integration, the application pair is supplied through `NOVACORE_SS_DEVID` and `NOVACORE_SS_DEVPASSWORD`; account fields may be prefilled through `NOVACORE_SS_USERNAME` and `NOVACORE_SS_PASSWORD`. Local configuration is not proof of provider approval: ScreenScraper verifies the application and account on use. No other application's credentials are borrowed, and no credentials are saved in settings or logs. Account fields apply to the current session.
+For maintainers configuring an authorized NovaCore integration, the application pair is supplied through `NOVACORE_SS_DEVID` and `NOVACORE_SS_DEVPASSWORD`. That application pair is never stored with personal account values. Local configuration is not proof of provider approval: ScreenScraper verifies actual access on use. Automatic adds this adapter only when both application integration and personal account are configured.
 
 See [ScreenScraper's API documentation](https://www.screenscraper.fr/webapi2.php) and the [provider notes](docs/providers.md). NovaCore needs its own application registration before it can offer the same account-only user setup as an integrated frontend.
+
+### Morning results and unresolved games
+
+The Downloads filters distinguish **Missing**, **Failed** and **Retry wait**. Details explain ambiguous names, unsupported platforms, unavailable covers, account/quota problems and temporary failures. **Export results** writes a durable CSV report with console, game, status, reason, source, actual region, match notes, attempts and saved artwork path. Export runs in the background, including during downloads. Choose a `.csv` report destination outside ROM, media, metadata and recovery folders; protected library files cannot be replaced by export.
+
+Existing artwork remains untouched. Starting the same consoles again checks completed files and works on remaining gaps. Missing means no acceptable cover was found under the selected policy; it is not proof that no cover exists anywhere. There is no manual game-identity picker in this version, and ambiguous records are reported rather than guessed.
 
 ## RetroBat can stay open
 
@@ -85,7 +128,7 @@ python -m venv .venv
 
 The headless self-test writes a JSON result containing a `success` boolean and returns a nonzero exit code on failure. The UI smoke test briefly opens and closes the desktop window and needs a graphical desktop. Neither option scans your real ROM library.
 
-Tests use temporary libraries, mocked process checks and local or fixture provider responses. They check library scanning, exact console scope, dropdown and row selection, flexible search, per-game cancellation, durable history, metadata preservation, live coverage totals, fallback failures, catalogue integrity and concurrent image reuse. Fixture tests do not prove live provider availability or account access. The Windows Actions workflow runs the fixture suite, opens a short UI smoke test, builds the executable, checks its headless self-test and uploads a portable ZIP. Check the workflow's actual result before relying on a build; a workflow definition alone is not evidence of a successful Windows run.
+Tests use temporary libraries, mocked process checks and local/fixture HTTP responses. They cover source schemas, authentication isolation, quotas, matching/alternative images, source cooldowns, retry/pause/cancel, protected CSV export, credential persistence races, live counts, ROM/metadata preservation and large queues. Windows checks exercise native DPAPI, the desktop UI and the packaged provider/parser/report paths. Public live checks are documented in the provider notes; credentialed APIs have fixture coverage only until authorized real accounts are supplied. Check the workflow's actual result before relying on a build; its definition alone is not proof of a successful Windows run.
 
 ## License
 

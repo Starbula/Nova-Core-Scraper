@@ -18,6 +18,11 @@ def self_test(output: Path) -> bool:
         from novacore_scraper.engine import ScrapeEngine
         from novacore_scraper.launchbox import LaunchBoxProvider
         from novacore_scraper.sources import FallbackProvider
+        from novacore_scraper.api_sources import TheGamesDBProvider, IGDBProvider
+        from novacore_scraper.gametdb import GameTDBProvider
+        from novacore_scraper.mobygames import MobyGamesProvider
+        from novacore_scraper.matching import MatchPolicy, match_title
+        from novacore_scraper.state import State
         import xml.etree.ElementTree as ET
         import zipfile
         class FixtureProvider:
@@ -45,6 +50,17 @@ def self_test(output: Path) -> bool:
             games = scan_system(nes)
             if len(games) != 1:
                 raise AssertionError('Fixture scan did not return one game')
+            policy = MatchPolicy()
+            if match_title(['Example (USA)'], games[0], policy, 'eu') is None:
+                raise AssertionError('Same-game regional cover fallback failed')
+            # Constructors and close must not contact services or require real
+            # keys; this verifies their imports inside the frozen executable.
+            adapters = [GameTDBProvider(root/'adapter-cache'),
+                        TheGamesDBProvider(root/'adapter-cache', 'fixture-not-a-key'),
+                        IGDBProvider(root/'adapter-cache', 'fixture-id', 'fixture-not-a-secret'),
+                        MobyGamesProvider(root/'adapter-cache', 'fixture-not-a-key')]
+            for adapter in adapters:
+                adapter.close()
             # Exercise SAX/Expat and catalogue indexing inside the frozen app,
             # where dynamically imported XML drivers could otherwise be absent.
             cache = root/'catalogue-fixture'
@@ -87,8 +103,17 @@ def self_test(output: Path) -> bool:
                 raise AssertionError('Repeated scrape did not skip existing artwork')
             if rom.read_bytes() != original:
                 raise AssertionError('Fixture ROM changed')
+            report = root/'artwork-fixture-report.csv'
+            if State.export_report(root, report) != 1 or 'Example' not in report.read_text(encoding='utf-8-sig'):
+                raise AssertionError('Fixture report export failed')
+            if sys.platform == 'win32':
+                from novacore_scraper.credentials import _protect, _unprotect
+                fixture = b'NovaCore packaged test, no real credential'
+                if _unprotect(_protect(fixture)) != fixture:
+                    raise AssertionError('Windows credential protection failed')
             result.update(success=True, tests=['discovery', 'scan', 'fixture image', 'process deferral', 'metadata', 'repeat skip', 'ROM integrity',
-                                               'LaunchBox catalogue parser', 'automatic source fallback'])
+                                               'LaunchBox catalogue parser', 'automatic source fallback', 'coverage matching',
+                                               'provider adapters', 'result report'])
     except Exception as exc:
         result['error'] = type(exc).__name__+': '+str(exc)
     output = output.absolute()

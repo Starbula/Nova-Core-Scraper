@@ -12,6 +12,7 @@ import pytest
 import requests
 
 from novacore_scraper.models import Game, System
+from novacore_scraper.matching import MatchPolicy
 from novacore_scraper.providers import Cancelled, ProviderError
 from novacore_scraper.launchbox import LaunchBoxProvider
 
@@ -82,7 +83,7 @@ def test_exact_platform_region_front_box_and_reusable_cache(tmp_path, transport)
 
 def test_verified_alias_and_conservative_qualifiers(tmp_path, transport):
     transport[0].append(catalogue(aliases=[('1', 'Mario Land')]))
-    p = LaunchBoxProvider(tmp_path / 'cache')
+    p = LaunchBoxProvider(tmp_path / 'cache', match_policy=MatchPolicy(False, False))
     assert p.find(game(tmp_path, 'Mario Land (Europe)'), lambda: None)
     for title in ('Super Mario Land 2 (Europe)', 'Super Mario Land (Europe) (Hack)', 'Mario Land (USA) (Rev 2)'):
         assert p.find(game(tmp_path, title), lambda: None) is None
@@ -181,7 +182,7 @@ def test_unqualified_alias_cannot_hide_a_hack_or_other_edition(tmp_path, transpo
 
 def test_explicit_region_does_not_choose_an_unrelated_regional_cover(tmp_path, transport):
     transport[0].append(catalogue(images=[('1', 'us.jpg', 'Box - Front', 'North America')]))
-    p = LaunchBoxProvider(tmp_path / 'cache')
+    p = LaunchBoxProvider(tmp_path / 'cache', match_policy=MatchPolicy(False, False))
     assert p.find(game(tmp_path), lambda: None) is None
     assert p.find(game(tmp_path, 'Super Mario Land (USA)'), lambda: None).region == 'us'
     p.close()
@@ -347,3 +348,73 @@ def test_refused_catalogue_is_not_retried_within_a_session_without_a_cache(tmp_p
     assert len(transport[1]) == 1
     assert list((tmp_path / 'cache').iterdir()) == []
     p.close()
+
+
+def test_normalized_alias_revision_and_region_fallback_is_annotated(tmp_path, transport):
+    transport[0].append(catalogue(games=[('1', 'Pokémon - Red Version', 'Nintendo Game Boy')],
+        aliases=[('1', 'PocketMonstersRed')], images=[('1', 'us.jpg', 'Box - Front', 'North America')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    result = p.find(game(tmp_path, 'PokemonRedVersion (Europe) (Rev 1)'), lambda: None)
+    assert result and result.region == 'us' and result.provider_game_id == '1'
+    assert 'base' in result.match_note.lower() and 'region' in result.match_note.lower()
+    assert p.find(game(tmp_path, 'Pocket Monsters Red (Europe)'), lambda: None)
+    p.close()
+
+
+def test_normalization_does_not_hide_duplicate_canonical_ids(tmp_path, transport):
+    transport[0].append(catalogue(games=[('1', 'Pokemon - Red Version', 'Nintendo Game Boy'),
+        ('2', 'PokémonRedVersion', 'Nintendo Game Boy')],
+        images=[('1', 'eu.jpg', 'Box - Front', 'Europe')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(game(tmp_path, 'Pokemon Red Version (Europe)'), lambda: None) is None
+    p.close()
+
+
+def test_parenthetical_title_content_matches_only_equivalent_full_text(tmp_path, transport):
+    transport[0].append(catalogue(games=[('1', 'Adventure (Episode II)', 'Nintendo Game Boy')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    assert p.find(game(tmp_path, 'Adventure Episode II (Europe)'), lambda: None)
+    assert p.find(game(tmp_path, 'Adventure (Europe)'), lambda: None) is None
+    p.close()
+
+
+def test_launchbox_candidates_are_lazy_ranked_and_keep_unique_identity(tmp_path, transport):
+    replies, calls = transport
+    replies.append(catalogue(images=[('1', 'eu-b.jpg', 'Box - Front', 'Europe'),
+        ('1', 'eu-a.jpg', 'Box - Front', 'Europe'), ('1', 'us.jpg', 'Box - Front', 'North America')]))
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    item = game(tmp_path)
+    candidates = p.candidates(item, lambda: None)
+    assert calls == []
+    results = list(candidates)
+    assert [result.url.rsplit('/', 1)[1] for result in results] == ['eu-a.jpg', 'eu-b.jpg', 'us.jpg']
+    assert {result.provider_game_id for result in results} == {'1'}
+    assert p.find(item, lambda: None) == results[0]
+    strict = LaunchBoxProvider(tmp_path / 'cache', match_policy=MatchPolicy(False, False))
+    assert [result.region for result in strict.candidates(item, lambda: None)] == ['eu', 'eu']
+    strict.close()
+    p.close()
+
+
+def test_engine_tries_another_launchbox_cover_after_404(tmp_path, transport):
+    from PIL import Image
+    from novacore_scraper.engine import ScrapeEngine
+    replies, calls = transport
+    replies.append(catalogue(games=[('1', 'Super Mario Land', 'Nintendo Game Boy'),
+        ('2', 'Super Mario Land 2', 'Nintendo Game Boy')],
+        images=[('1', 'eu.jpg', 'Box - Front', 'Europe'), ('1', 'us.png', 'Box - Front', 'North America'),
+                ('2', 'wrong.png', 'Box - Front', 'Europe')]))
+    raw = io.BytesIO()
+    Image.new('RGB', (2, 2), 'red').save(raw, 'PNG')
+    replies.extend([(404, b'missing image'), raw.getvalue()])
+    item = game(tmp_path)
+    item.path.parent.mkdir(parents=True)
+    item.path.write_bytes(b'ROM unchanged')
+    p = LaunchBoxProvider(tmp_path / 'cache')
+    engine = ScrapeEngine(tmp_path, p, process_running=lambda: True, retry_passes=0, keep_awake=False)
+    engine.start([item])
+    assert engine.wait(5)
+    assert (engine.snapshot().completed, engine.snapshot().missing, engine.snapshot().failed) == (1, 0, 0)
+    job = engine.jobs_page()[0][0]
+    assert job.region == 'us' and 'region' in job.match_note.lower() and Path(job.artwork).is_file()
+    assert calls[-2:] == ['https://images.launchbox-app.com/eu.jpg', 'https://images.launchbox-app.com/us.png']

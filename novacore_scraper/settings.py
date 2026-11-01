@@ -1,4 +1,4 @@
-"""Portable non-secret settings. API credentials are session-only or environment supplied."""
+"""Portable non-secret settings; optional Windows credential protection is separate."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -16,6 +16,11 @@ class Settings:
     workers: int = 8
     interval: float = .25
     selected_systems: list[str] = field(default_factory=list)
+    allow_other_regions: bool = True
+    allow_base_cover: bool = True
+    retry_failed: bool = True
+    keep_awake: bool = True
+    remember_credentials: bool = True
 
 
 def app_directory() -> Path:
@@ -50,11 +55,13 @@ def load_settings() -> Settings:
                 interval=.25
         return Settings(
             retrobat_folder=folder,
-            provider=provider if provider in ('automatic','libretro','launchbox','screenscraper') else 'automatic',
+            provider=provider if provider in ('automatic','libretro','launchbox','gametdb','thegamesdb','igdb','mobygames','screenscraper') else 'automatic',
             region=raw.get('region') if raw.get('region') in ('eu','us','jp','wor','fr','de','uk','es','it','br','au') else 'eu',
             workers=max(1,min(16,workers)),
             interval=max(.25,min(60,interval)),
             selected_systems=[x for x in selected if isinstance(x,str)],
+            **{key: raw.get(key) if isinstance(raw.get(key), bool) else True
+               for key in ('allow_other_regions', 'allow_base_cover', 'retry_failed', 'keep_awake', 'remember_credentials')},
         )
     except (OSError,ValueError,TypeError,OverflowError):
         return Settings()
@@ -64,7 +71,7 @@ def save_settings(settings: Settings):
     directory=data_directory()
     directory.mkdir(parents=True,exist_ok=True)
     raw=asdict(settings)
-    raw['version']=2
+    raw['version']=3
     if raw['retrobat_folder']:
         try:
             raw['retrobat_folder']=os.path.relpath(raw['retrobat_folder'],app_directory())

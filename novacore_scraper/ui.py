@@ -9,16 +9,24 @@ import queue
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from . import auth
+from .credentials import (configured_credentials, save_credentials, clear_credentials,
+                          can_remember_credentials)
 from .engine import ScrapeEngine
 from .library import detect_installations
 from .scan import scan_library
 from .models import Game, System
 from .providers import LibretroProvider, ScreenScraperProvider
 from .launchbox import LaunchBoxProvider
+from .gametdb import GameTDBProvider
+from .api_sources import TheGamesDBProvider, IGDBProvider
+from .mobygames import MobyGamesProvider
+from .matching import MatchPolicy
 from .sources import FallbackProvider
+from .state import State
 from .settings import Settings, data_directory, load_settings, save_settings
 
 LOG = logging.getLogger(__name__)
@@ -39,7 +47,16 @@ DARK_COLORS = {
 _CREDENTIALS = (
     ('username', 'ScreenScraper username', 'NOVACORE_SS_USERNAME'),
     ('password', 'ScreenScraper password', 'NOVACORE_SS_PASSWORD'),
+    ('tgdb_api_key', 'TheGamesDB API key', 'NOVACORE_TGDB_API_KEY'),
+    ('igdb_client_id', 'IGDB client ID', 'NOVACORE_IGDB_CLIENT_ID'),
+    ('igdb_client_secret', 'IGDB client secret', 'NOVACORE_IGDB_CLIENT_SECRET'),
+    ('mobygames_api_key', 'MobyGames API key', 'NOVACORE_MOBYGAMES_API_KEY'),
 )
+PROVIDERS = ('automatic', 'libretro', 'launchbox', 'gametdb', 'thegamesdb', 'igdb', 'mobygames', 'screenscraper')
+SOURCE_NAMES = {'libretro': 'Libretro', 'launchbox': 'LaunchBox', 'gametdb': 'GameTDB',
+                'screenscraper': 'ScreenScraper', 'thegamesdb': 'TheGamesDB',
+                'igdb': 'IGDB', 'mobygames': 'MobyGames'}
+CREDENTIALS_LOADING = 'Loading saved provider credentials…'
 
 
 def _dark_window(window: tk.Tk | tk.Toplevel) -> None:
@@ -186,8 +203,8 @@ class ConsoleSelection:
 
 PAGE_SIZE = 200
 JOB_FILTERS = ('All statuses', 'Active', 'checking', 'queued', 'finding', 'downloading',
-               'completed', 'skipped', 'missing', 'failed', 'cancelled')
-ACTIVE_JOB_STATES = ('checking', 'queued', 'finding', 'downloading')
+               'retry_wait', 'completed', 'skipped', 'missing', 'failed', 'cancelled')
+ACTIVE_JOB_STATES = ('checking', 'queued', 'finding', 'downloading', 'retry_wait')
 
 
 class App:
@@ -214,6 +231,8 @@ class App:
         self._cancel_scan = threading.Event()
         self._worker_thread = None
         self._worker_kind = ''
+        self._background_threads = {}
+        self._background_pending = {}
         self._generation = 0
         self._closing = False
         self._filter_after = None
@@ -242,6 +261,7 @@ class App:
         self.counts_var = tk.StringVar(value='Existing: 0   Downloaded: 0   Missing: 0   Failed: 0   Cancelled: 0   Queued metadata: 0')
         self.provider_var = tk.StringVar()
         self.auth_status_var = tk.StringVar()
+        self.sources_status_var = tk.StringVar()
         self.settings_status_var = tk.StringVar()
         self.provider_setting_var = tk.StringVar(value=self.settings.provider)
         self.region_setting_var = tk.StringVar(value=self.settings.region)
@@ -249,15 +269,31 @@ class App:
         self.workers_setting_var = tk.StringVar(value=str(self.settings.workers))
         self.account_username_var = tk.StringVar(value=self.credentials['username'])
         self.account_password_var = tk.StringVar(value=self.credentials['password'])
+        self.tgdb_key_var = tk.StringVar(value=self.credentials['tgdb_api_key'])
+        self.igdb_id_var = tk.StringVar(value=self.credentials['igdb_client_id'])
+        self.igdb_secret_var = tk.StringVar(value=self.credentials['igdb_client_secret'])
+        self.moby_key_var = tk.StringVar(value=self.credentials['mobygames_api_key'])
+        self._credential_vars = dict(zip((item[0] for item in _CREDENTIALS),
+            (self.account_username_var, self.account_password_var, self.tgdb_key_var,
+             self.igdb_id_var, self.igdb_secret_var, self.moby_key_var)))
+        self._initial_credentials = dict(self.credentials)
+        self._credential_edited = set()
+        self._remember_available = can_remember_credentials()
+        self.remember_credentials_var = tk.BooleanVar(value=self.settings.remember_credentials and self._remember_available)
+        self.allow_other_regions_var = tk.BooleanVar(value=self.settings.allow_other_regions)
+        self.allow_base_cover_var = tk.BooleanVar(value=self.settings.allow_base_cover)
+        self.retry_failed_var = tk.BooleanVar(value=self.settings.retry_failed)
+        self.keep_awake_var = tk.BooleanVar(value=self.settings.keep_awake)
         self._build()
         self.provider_setting_var.trace_add('write', self._provider_changed)
-        self.account_username_var.trace_add('write', self._provider_changed)
-        self.account_password_var.trace_add('write', self._provider_changed)
+        for key, variable in self._credential_vars.items():
+            variable.trace_add('write', lambda *_args, key=key:self._credential_changed(key))
         self._refresh_provider()
         self._refresh_buttons()
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self._poll_after = self.root.after(100, self._poll)
         if not self._smoke_test:
+            self._run_background('credentials-load', configured_credentials, independent=True)
             self._startup_after = self.root.after(150, self.autodetect)
 
     def _build(self) -> None:
@@ -434,6 +470,9 @@ class App:
             self.cancel_all_button = ttk.Button(cancel, text='Cancel all', command=self.cancel_all)
             self.cancel_all_button.grid(row=0, column=1)
             ttk.Label(cancel, text='Completed artwork files are kept.').grid(row=0, column=2, padx=12)
+            self.export_results_button = ttk.Button(cancel, text='Export results…', command=self.export_results)
+            self.export_results_button.grid(row=0, column=3, padx=(12, 0))
+            ttk.Label(tab, text='Filter Missing or Failed to review unresolved games. Export includes all results and match notes.').grid(row=4, column=0, sticky='w', pady=(8, 0))
         self._pages[name] = dict(tree=tree, query=query, status=status, offset=0, total=0, label=label,
                                  previous=previous, next=next_button, after=None, requested=None,
                                  applied=None, ticket=0)
@@ -441,11 +480,33 @@ class App:
         status.trace_add('write', lambda *_args: self._page_status_changed(name))
 
     def _build_settings(self) -> None:
-        tab = self.settings_tab
+        self.settings_tab.columnconfigure(0, weight=1)
+        self.settings_tab.rowconfigure(0, weight=1)
+        self.settings_canvas = tk.Canvas(self.settings_tab, background=DARK_COLORS['background'],
+                                        highlightthickness=0, borderwidth=0)
+        self.settings_canvas.grid(row=0, column=0, sticky='nsew')
+        scrollbar = ttk.Scrollbar(self.settings_tab, orient='vertical', command=self.settings_canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        self.settings_canvas.configure(yscrollcommand=scrollbar.set)
+        tab = ttk.Frame(self.settings_canvas, padding=(0, 0, 16, 12))
         tab.columnconfigure(1, weight=1)
+        window = self.settings_canvas.create_window((0, 0), window=tab, anchor='nw')
+        tab.bind('<Configure>', lambda _event:self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox('all')))
+        def resize(event):
+            self.settings_canvas.itemconfigure(window, width=event.width)
+            pending = list(tab.winfo_children())
+            while pending:
+                widget = pending.pop()
+                pending.extend(widget.winfo_children())
+                if isinstance(widget, ttk.Label) and int(widget.cget('wraplength') or 0):
+                    widget.configure(wraplength=max(240, event.width-48))
+        self.settings_canvas.bind('<Configure>', resize)
+        self.root.bind('<MouseWheel>', self._scroll_settings, add='+')
+        self.root.bind('<Button-4>', self._scroll_settings, add='+')
+        self.root.bind('<Button-5>', self._scroll_settings, add='+')
         self._settings_controls = []
         fields = (
-            ('Artwork provider', self.provider_setting_var, ('automatic', 'libretro', 'launchbox', 'screenscraper')),
+            ('Artwork provider', self.provider_setting_var, PROVIDERS),
             ('Preferred region', self.region_setting_var, ('eu', 'us', 'jp', 'wor', 'fr', 'de', 'uk', 'es', 'it', 'br', 'au')),
         )
         for row, (label, variable, values) in enumerate(fields):
@@ -453,46 +514,95 @@ class App:
             widget = ttk.Combobox(tab, textvariable=variable, values=values, state='readonly', width=30)
             widget.grid(row=row, column=1, sticky='w', pady=5)
             self._settings_controls.append((widget, 'readonly'))
-        ttk.Label(tab, textvariable=self.auth_status_var, wraplength=960).grid(row=2, column=0, columnspan=2, sticky='w', pady=(6, 12))
-        account = ttk.LabelFrame(tab, text='ScreenScraper account · current session only', padding=10)
-        account.grid(row=3, column=0, columnspan=2, sticky='ew')
+        ttk.Label(tab, textvariable=self.auth_status_var, wraplength=900).grid(row=2, column=0, columnspan=2, sticky='w', pady=(6, 8))
+        ttk.Label(tab, textvariable=self.sources_status_var, wraplength=900).grid(row=3, column=0, columnspan=2, sticky='w', pady=(0, 12))
+        account = ttk.LabelFrame(tab, text='Optional accounts · automatic mode also uses configured accounts', padding=10)
+        account.grid(row=4, column=0, columnspan=2, sticky='ew')
         account.columnconfigure(1, weight=1)
         self._account_entries = []
-        for row, (label, variable, secret) in enumerate((('Username', self.account_username_var, False), ('Password', self.account_password_var, True))):
+        self._credential_entries = []
+        for row, (key, label, _env) in enumerate(_CREDENTIALS):
             ttk.Label(account, text=label).grid(row=row, column=0, sticky='w', padx=(0, 16), pady=4)
-            widget = ttk.Entry(account, textvariable=variable, show='•' if secret else '', width=42)
-            widget.grid(row=row, column=1, sticky='w', pady=4)
-            self._account_entries.append(widget)
+            widget = ttk.Entry(account, textvariable=self._credential_vars[key],
+                               show='' if key in ('username', 'igdb_client_id') else '•', width=42)
+            widget.grid(row=row, column=1, sticky='ew', pady=4)
+            self._credential_entries.append(widget)
+            if key in ('username', 'password'):
+                self._account_entries.append(widget)
+        links = ttk.Frame(account)
+        links.grid(row=6, column=0, columnspan=2, sticky='w', pady=(8, 4))
+        for column, (label, url) in enumerate((
+            ('TheGamesDB API setup', 'https://api.thegamesdb.net/key.php'),
+            ('IGDB API setup', 'https://api-docs.igdb.com/'),
+            ('MobyGames API subscription', 'https://www.mobygames.com/api/subscribe/'))):
+            ttk.Button(links, text=label, command=lambda url=url:webbrowser.open(url)).grid(row=0, column=column, padx=(0, 8))
+        ttk.Label(account, text='Data by MobyGames.com', foreground=DARK_COLORS['accent']).grid(row=7, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        self.remember_credentials_button = ttk.Checkbutton(account, text='Remember credentials for this Windows account',
+                                                           variable=self.remember_credentials_var)
+        self.remember_credentials_button.grid(row=8, column=0, columnspan=2, sticky='w', pady=(8, 0))
+        ttk.Label(account, text=('Saved credentials are tied to this Windows account; other accounts or PCs require entry again. Environment variables override saved values.'
+                  if self._remember_available else 'Credentials stay in this session. Remembering credentials requires Windows account protection.'),
+                  wraplength=860).grid(row=9, column=0, columnspan=2, sticky='w', pady=(4, 0))
         rate = ttk.Frame(tab)
-        rate.grid(row=4, column=0, columnspan=2, sticky='w', pady=12)
+        rate.grid(row=5, column=0, columnspan=2, sticky='w', pady=12)
         for column, (label, variable, minimum, maximum, increment) in enumerate((
             ('Seconds between requests', self.interval_setting_var, .25, 60, .25),
             ('Concurrent requests (1–16)', self.workers_setting_var, 1, 16, 1))):
             ttk.Label(rate, text=label).grid(row=0, column=column*2, padx=(0, 8))
             widget = ttk.Spinbox(rate, textvariable=variable, from_=minimum, to=maximum, increment=increment, width=8)
-            widget.grid(row=0, column=column*2+1, padx=(0, 24))
+            widget.grid(row=0, column=column*2+1, padx=(0, 16))
             self._settings_controls.append((widget, 'normal'))
         self.fast_preset_button = ttk.Button(rate, text='Fast preset · 8 / 0.25 s', command=self.use_fast_preset)
         self.fast_preset_button.grid(row=0, column=4)
         self._settings_controls.append((self.fast_preset_button, 'normal'))
-        ttk.Label(tab, text='Per-provider request and account limits may reduce concurrency. Account passwords are never saved.').grid(row=5, column=0, columnspan=2, sticky='w')
+        ttk.Label(tab, text='Per-provider request limits and account quotas may reduce concurrency.', wraplength=900).grid(row=6, column=0, columnspan=2, sticky='w')
+        options = ttk.LabelFrame(tab, text='Unattended coverage', padding=10)
+        options.grid(row=7, column=0, columnspan=2, sticky='ew', pady=12)
+        for row, (label, variable) in enumerate((
+            ('Use another-region cover for the same game', self.allow_other_regions_var),
+            ('Use base-game cover for revisions/discs', self.allow_base_cover_var),
+            ('Retry temporary failures in up to two delayed passes', self.retry_failed_var),
+            ('Keep PC awake while scraping (Windows)', self.keep_awake_var))):
+            widget = ttk.Checkbutton(options, text=label, variable=variable)
+            widget.grid(row=row, column=0, sticky='w', pady=3)
+            self._settings_controls.append((widget, 'normal'))
+        ttk.Label(options, text='Fallback choices are recorded in results. Ambiguous games remain unresolved.', wraplength=880).grid(row=4, column=0, sticky='w', pady=(6, 0))
         media = ttk.Frame(tab)
-        media.grid(row=6, column=0, columnspan=2, sticky='w', pady=12)
+        media.grid(row=8, column=0, columnspan=2, sticky='w', pady=(0, 12))
         self._media_vars = [tk.BooleanVar(value=value) for value in (True, False, False, False)]
         for row, (label, variable) in enumerate(zip(('Box artwork', 'Manuals (unavailable)', 'Ratings (unavailable)', 'Pad-to-key (unavailable)'), self._media_vars)):
             ttk.Checkbutton(media, text=label, variable=variable, state='disabled').grid(row=row, column=0, sticky='w')
         self.settings_save_button = ttk.Button(tab, text='Save settings', command=self._apply_settings)
-        self.settings_save_button.grid(row=7, column=0, sticky='w', pady=(4, 8))
+        self.settings_save_button.grid(row=9, column=0, sticky='w', pady=(4, 8))
         self.settings_button = self.settings_save_button
-        ttk.Label(tab, textvariable=self.settings_status_var, wraplength=950).grid(row=8, column=0, columnspan=2, sticky='w')
+        ttk.Label(tab, textvariable=self.settings_status_var, wraplength=900).grid(row=10, column=0, columnspan=2, sticky='w')
+
+    def _scroll_settings(self, event):
+        if self.notebook.select() != str(self.settings_tab):
+            return
+        amount = -1 if getattr(event, 'num', 0) == 4 else 1 if getattr(event, 'num', 0) == 5 else (-1 if event.delta > 0 else 1)
+        self.settings_canvas.yview_scroll(amount * 3, 'units')
+        return 'break'
 
     @property
     def busy(self) -> bool:
         return bool(self._worker_kind or (self.engine and self.engine.active))
 
     def _provider_ready(self) -> bool:
-        return self.provider_setting_var.get() != 'screenscraper' or bool(
-            auth.screen_scraper_app_credentials() and self.account_username_var.get().strip() and self.account_password_var.get().strip())
+        return ('credentials-load' not in self._background_threads
+                and self._source_ready(self.provider_setting_var.get()))
+
+    def _source_ready(self, name) -> bool:
+        if name == 'screenscraper':
+            return bool(auth.screen_scraper_app_credentials() and self.account_username_var.get().strip()
+                        and self.account_password_var.get().strip())
+        if name == 'thegamesdb':
+            return bool(self.tgdb_key_var.get().strip())
+        if name == 'igdb':
+            return bool(self.igdb_id_var.get().strip() and self.igdb_secret_var.get().strip())
+        if name == 'mobygames':
+            return bool(self.moby_key_var.get().strip())
+        return name in ('automatic', 'libretro', 'launchbox', 'gametdb')
 
     def _refresh_buttons(self) -> None:
         available = not self.busy and not self._closing
@@ -506,9 +616,9 @@ class App:
         self.console_dropdown.configure(state='readonly' if available and self.selection.systems else 'disabled')
         for widget, state in self._settings_controls:
             widget.configure(state=state if available else 'disabled')
-        account_enabled = available and self.provider_setting_var.get() == 'screenscraper'
-        for widget in self._account_entries:
-            widget.configure(state='normal' if account_enabled else 'disabled')
+        for widget in self._credential_entries:
+            widget.configure(state='normal' if available else 'disabled')
+        self.remember_credentials_button.configure(state='normal' if available and self._remember_available else 'disabled')
         self.use_automatic_button.configure(state='normal' if available and self.provider_setting_var.get() != 'automatic' else 'disabled')
         active = bool(self.engine and self.engine.active)
         state = self.engine.snapshot().state if active else ''
@@ -516,6 +626,8 @@ class App:
         self.stop_button.configure(state='normal' if not self._closing and (active and state != 'Stopping' or self._worker_kind in ('scan', 'detect')) else 'disabled')
         self.cancel_selected_button.configure(state='normal' if active and self.jobs_tree.selection() and not self._closing else 'disabled')
         self.cancel_all_button.configure(state='normal' if active and not self._closing else 'disabled')
+        self.export_results_button.configure(state='normal' if self.retrobat_root and not self._closing
+                                             and 'export' not in self._background_threads else 'disabled')
         for page in self._pages.values():
             page['previous'].configure(state='normal' if page['offset'] > 0 and not self._closing else 'disabled')
             page['next'].configure(state='normal' if page['offset']+PAGE_SIZE < page['total'] and not self._closing else 'disabled')
@@ -524,8 +636,20 @@ class App:
         self._refresh_provider()
         self._refresh_buttons()
 
+    def _credential_changed(self, key) -> None:
+        self._credential_edited.add(key)
+        self.credentials[key] = self._credential_vars[key].get()
+        self._provider_changed()
+
     def _refresh_provider(self) -> None:
-        if self.provider_setting_var.get() == 'screenscraper':
+        name = self.provider_setting_var.get()
+        configured = [SOURCE_NAMES[source] for source in ('screenscraper', 'thegamesdb', 'igdb', 'mobygames') if self._source_ready(source)]
+        unconfigured = [SOURCE_NAMES[source] for source in ('screenscraper', 'thegamesdb', 'igdb', 'mobygames') if not self._source_ready(source)]
+        self.sources_status_var.set('Available without accounts: Libretro, LaunchBox, GameTDB (Wii/GameCube). '
+            + ('Configured accounts: ' + ', '.join(configured) + '. ' if configured else 'Configured accounts: none. ')
+            + ('Unconfigured optional sources: ' + ', '.join(unconfigured) + '.' if unconfigured else 'All optional accounts configured.')
+            + ' Service access is verified when scraping starts.')
+        if name == 'screenscraper':
             self.auth_status_var.set(auth.screen_scraper_status())
             if not auth.screen_scraper_app_credentials():
                 self.provider_var.set(auth.screen_scraper_status())
@@ -533,13 +657,21 @@ class App:
                 self.provider_var.set('ScreenScraper: enter your username and password in Settings before starting.')
             else:
                 self.provider_var.set('ScreenScraper account configured · Service access is verified when scraping starts.')
-        elif self.provider_setting_var.get() == 'libretro':
+        elif name == 'libretro':
             self.provider_var.set('Libretro · Ready to download box artwork without an account.')
-        elif self.provider_setting_var.get() == 'launchbox':
+        elif name == 'launchbox':
             self.provider_var.set('LaunchBox · No account needed. First use downloads a catalogue of about 110 MB; later runs use its cache.')
+        elif name == 'gametdb':
+            self.provider_var.set('GameTDB · No account needed. Verified Wii and GameCube front covers.')
+        elif name in ('thegamesdb', 'igdb', 'mobygames'):
+            self.provider_var.set(f'{SOURCE_NAMES[name]} · Credentials configured; service access is verified when scraping starts.'
+                                  if self._source_ready(name) else f'{SOURCE_NAMES[name]} · Unconfigured. Add your authorized API credentials in Settings.')
         else:
-            self.provider_var.set('Automatic · Libretro → LaunchBox fallback, without an account. First LaunchBox use downloads a catalogue of about 110 MB; later runs use its cache.')
-        if self.provider_setting_var.get() != 'screenscraper':
+            chain = ['Libretro', 'LaunchBox', 'GameTDB'] + configured
+            self.provider_var.set('Automatic · ' + ' → '.join(chain) + '. Public sources work without an account; GameTDB covers Wii/GameCube.')
+        if 'credentials-load' in self._background_threads:
+            self.provider_var.set(CREDENTIALS_LOADING + ' Start will be ready when they are loaded.')
+        if name != 'screenscraper':
             self.auth_status_var.set(self.provider_var.get())
 
     def use_automatic(self) -> None:
@@ -548,7 +680,7 @@ class App:
         self.provider_setting_var.set('automatic')
         self.settings = replace(self.settings, provider='automatic')
         self._persist()
-        self.status_var.set('Automatic sources selected: Libretro, then LaunchBox. Choose a console and start scraping.')
+        self.status_var.set('Automatic sources selected: public sources, then configured accounts. Choose a console and start scraping.')
 
     def use_fast_preset(self) -> None:
         if self.busy or self._closing:
@@ -698,19 +830,36 @@ class App:
                 pass
             self._events.put_nowait(event)
 
-    def _run_background(self, kind: str, operation) -> None:
-        self._generation += 1
-        generation = self._generation
-        self._worker_kind = kind
+    def _run_background(self, kind: str, operation, *, independent=False) -> None:
+        if independent:
+            if kind in self._background_threads:
+                self._background_pending[kind] = operation
+                return
+            generation = None
+        else:
+            self._generation += 1
+            generation = self._generation
+            self._worker_kind = kind
         def run():
             try:
                 self._post((generation, kind, operation(), None))
             except Exception as exc:
                 LOG.warning('%s failed (%s)', kind, type(exc).__name__)
-                message = str(exc) if kind in ('scan', 'detect') else 'Could not apply pending metadata. Check installation write permissions.'
+                message = (str(exc) if kind in ('scan', 'detect') else
+                           'Could not export results. Choose a writable destination and try again.' if kind == 'export' else
+                           'Could not remember credentials. They still work for this session.' if kind == 'credentials-save' else
+                           'Could not load saved credentials. Enter them in Settings for this session.' if kind == 'credentials-load' else
+                           'Could not apply pending metadata. Check installation write permissions.')
                 self._post((generation, kind, None, message))
-        self._worker_thread = threading.Thread(target=run, name=f'NovaCore {kind}', daemon=True)
-        self._worker_thread.start()
+        thread = threading.Thread(target=run, name=f'NovaCore {kind}', daemon=True)
+        if independent:
+            self._background_threads[kind] = thread
+            if kind == 'credentials-load':
+                self.status_var.set(CREDENTIALS_LOADING)
+                self._refresh_provider()
+        else:
+            self._worker_thread = thread
+        thread.start()
         self._refresh_buttons()
 
     def browse(self) -> None:
@@ -773,22 +922,47 @@ class App:
 
     def _make_provider(self):
         cache = data_directory() / 'cache'
-        options = dict(region=self.settings.region, interval=self.settings.interval, workers=self.settings.workers)
-        if self.settings.provider == 'screenscraper':
-            application = auth.screen_scraper_app_credentials()
-            if application is None:
-                raise ValueError(auth.screen_scraper_status())
-            if not self.credentials['username'].strip() or not self.credentials['password'].strip():
-                raise ValueError('Enter your ScreenScraper username and password in Settings first.')
-            return ScreenScraperProvider(cache, devid=application[0], devpassword=application[1], **self.credentials, **options)
-        if self.settings.provider == 'launchbox':
-            return LaunchBoxProvider(cache, **options)
+        options = dict(region=self.settings.region, interval=self.settings.interval, workers=self.settings.workers,
+                       match_policy=MatchPolicy(allow_other_regions=self.settings.allow_other_regions,
+                                                allow_base_cover=self.settings.allow_base_cover))
+        credentials = self.credentials
+        def make(name):
+            if name == 'screenscraper':
+                application = auth.screen_scraper_app_credentials()
+                if application is None:
+                    raise ValueError(auth.screen_scraper_status())
+                if not credentials['username'].strip() or not credentials['password'].strip():
+                    raise ValueError('Enter your ScreenScraper username and password in Settings first.')
+                return ScreenScraperProvider(cache, devid=application[0], devpassword=application[1],
+                    username=credentials['username'], password=credentials['password'], **options)
+            if name == 'thegamesdb':
+                return TheGamesDBProvider(cache, api_key=credentials['tgdb_api_key'], **options)
+            if name == 'igdb':
+                return IGDBProvider(cache, client_id=credentials['igdb_client_id'],
+                                    client_secret=credentials['igdb_client_secret'], **options)
+            if name == 'mobygames':
+                return MobyGamesProvider(cache, api_key=credentials['mobygames_api_key'], **options)
+            return {'libretro':LibretroProvider, 'launchbox':LaunchBoxProvider, 'gametdb':GameTDBProvider}[name](cache, **options)
         if self.settings.provider == 'automatic':
-            return FallbackProvider([LibretroProvider(cache, **options), LaunchBoxProvider(cache, **options)], workers=self.settings.workers)
-        return LibretroProvider(cache, **options)
+            names = ['libretro', 'launchbox', 'gametdb']
+            if auth.screen_scraper_app_credentials() and credentials['username'].strip() and credentials['password'].strip():
+                names.append('screenscraper')
+            if credentials['tgdb_api_key'].strip():
+                names.append('thegamesdb')
+            if credentials['igdb_client_id'].strip() and credentials['igdb_client_secret'].strip():
+                names.append('igdb')
+            if credentials['mobygames_api_key'].strip():
+                names.append('mobygames')
+            return FallbackProvider([make(name) for name in names], workers=self.settings.workers)
+        if not self._source_ready(self.settings.provider):
+            raise ValueError(f'{SOURCE_NAMES.get(self.settings.provider, self.settings.provider)} is unconfigured. Enter authorized credentials in Settings first.')
+        return make(self.settings.provider)
 
     def start(self) -> None:
         if self.busy or self._closing or not self.retrobat_root:
+            return
+        if 'credentials-load' in self._background_threads:
+            self.status_var.set(CREDENTIALS_LOADING)
             return
         games = self.selection.games(self.games_by_system)
         if not games:
@@ -800,7 +974,9 @@ class App:
         try:
             provider = self._make_provider()
             self._refresh_artwork_counts(force=True)
-            self.engine = ScrapeEngine(self.retrobat_root, provider)
+            self.engine = ScrapeEngine(self.retrobat_root, provider,
+                                       retry_passes=2 if self.settings.retry_failed else 0,
+                                       keep_awake=self.settings.keep_awake)
             self._run_scope = self.selection_var.get() + ' · ' + self.scope_var.get()
             self.engine.start(games)
             self._invalidate_pages()
@@ -845,6 +1021,18 @@ class App:
             self._refresh_buttons()
             self._request_page('jobs', force=True)
 
+    def export_results(self) -> None:
+        if self._closing or not self.retrobat_root or 'export' in self._background_threads:
+            return
+        filename = filedialog.asksaveasfilename(parent=self.root, title='Choose a CSV report destination',
+            defaultextension='.csv', initialfile='novacore-artwork-results.csv',
+            filetypes=(('CSV report', '*.csv'),))
+        if filename:
+            root, destination = self.retrobat_root, Path(filename)
+            self._export_destination = destination
+            self.status_var.set('Exporting all artwork results…')
+            self._run_background('export', lambda:State.export_report(root, destination), independent=True)
+
     def _persist(self) -> None:
         if self._smoke_test:
             return
@@ -868,10 +1056,33 @@ class App:
             self.settings_status_var.set('Use 0.25–60 seconds between requests and 1–16 concurrent requests.')
             self.status_var.set(self.settings_status_var.get())
             return False
-        self.settings = replace(self.settings, provider=self.provider_setting_var.get(), region=self.region_setting_var.get(), interval=interval, workers=workers)
-        self.credentials = dict(username=self.account_username_var.get(), password=self.account_password_var.get())
+        self.settings = replace(self.settings, provider=self.provider_setting_var.get(), region=self.region_setting_var.get(),
+            interval=interval, workers=workers, allow_other_regions=self.allow_other_regions_var.get(),
+            allow_base_cover=self.allow_base_cover_var.get(), retry_failed=self.retry_failed_var.get(),
+            keep_awake=self.keep_awake_var.get(), remember_credentials=self.remember_credentials_var.get())
+        self.credentials = {key:variable.get() for key, variable in self._credential_vars.items()}
         self._persist()
-        self.settings_status_var.set('Settings saved. Account details stay in this session only.')
+        self.settings_status_var.set('Settings saved. Credentials work for this session.')
+        if not self._smoke_test and self._remember_available:
+            values = dict(self.credentials)
+            remember = self.remember_credentials_var.get()
+            loading = 'credentials-load' in self._background_threads
+            changed = set(self._credential_edited)
+            changed.update(key for key, value in self._initial_credentials.items() if value.strip())
+            def store():
+                if remember:
+                    if loading:
+                        # A quick Start must not erase keys whose startup read
+                        # has not reached Tk yet. Typed values still take priority.
+                        merged = configured_credentials()
+                        merged.update({key:value for key, value in values.items() if key in changed})
+                        save_credentials(merged)
+                    else:
+                        save_credentials(values)
+                    return 'Settings and credentials saved for this Windows account.'
+                clear_credentials()
+                return 'Settings saved. Remembered credentials cleared; current values stay in this session.'
+            self._run_background('credentials-save', store, independent=True)
         self._refresh_provider()
         return True
 
@@ -880,6 +1091,28 @@ class App:
 
     def _handle_result(self, event) -> None:
         generation, kind, result, error = event
+        if generation is None:
+            self._background_threads.pop(kind, None)
+            if kind == 'credentials-load':
+                if not error:
+                    for key, variable in self._credential_vars.items():
+                        if key not in self._credential_edited and variable.get() == self._initial_credentials[key]:
+                            value = os.environ.get(next(env for name, _label, env in _CREDENTIALS if name == key), '')
+                            variable.set(value if value.strip() else result.get(key, ''))
+                elif error:
+                    self.settings_status_var.set(error)
+                self._refresh_provider()
+                if self.status_var.get() == CREDENTIALS_LOADING:
+                    self.status_var.set(error or 'Provider credentials loaded. Choose a console and start scraping.')
+            elif kind == 'credentials-save':
+                self.settings_status_var.set(error or result)
+            elif kind == 'export':
+                self.status_var.set(error or f'Exported {result:,} artwork results to {self._export_destination}.')
+            pending = self._background_pending.pop(kind, None)
+            if pending is not None and (not self._closing or kind == 'credentials-save'):
+                self._run_background(kind, pending, independent=True)
+            self._refresh_buttons()
+            return
         if generation != self._generation:
             return
         self._worker_thread = None
@@ -1059,7 +1292,12 @@ class App:
                 selected = set(page['tree'].selection())
                 page['tree'].delete(*page['tree'].get_children())
                 for row in rows:
-                    page['tree'].insert('', 'end', iid=row.key, values=(row.title, row.console, row.status.title(), row.artwork if name == 'downloaded' else row.detail or row.artwork))
+                    parts = [row.artwork if name == 'downloaded' else row.detail or row.artwork]
+                    parts.extend(str(getattr(row, field, '')) for field in ('source', 'region', 'reason', 'match_note'))
+                    if getattr(row, 'attempts', 0) > 1:
+                        parts.append(f'{row.attempts} attempts')
+                    detail = ' · '.join(dict.fromkeys(part for part in parts if part))
+                    page['tree'].insert('', 'end', iid=row.key, values=(row.title, row.console, row.status.replace('_', ' ').capitalize(), detail))
                 selected.intersection_update(page['tree'].get_children())
                 if selected:
                     page['tree'].selection_set(*selected)
@@ -1089,13 +1327,14 @@ class App:
                 event = self._events.get_nowait()
             except queue.Empty:
                 break
-            if not self._closing:
+            if not self._closing or event[0] is None:
                 self._handle_result(event)
         self._drain_pages()
         if self._closing:
             if self._worker_thread is None or not self._worker_thread.is_alive():
                 self._worker_kind = ''
-            if not self.busy and (self._page_thread is None or not self._page_thread.is_alive()):
+            if not self.busy and (self._page_thread is None or not self._page_thread.is_alive()) and not any(
+                    thread.is_alive() for thread in self._background_threads.values()) and not self._background_pending:
                 self.root.destroy()
                 return
         else:
@@ -1120,6 +1359,8 @@ class App:
         self._closing = True
         self._cancel_scan.set()
         self._pending_pages.clear()
+        self._background_pending = {kind:operation for kind, operation in self._background_pending.items()
+                                    if kind == 'credentials-save'}
         if self.engine and self.engine.active:
             self.engine.stop()
         for handle in (self._filter_after, self._startup_after, *(page['after'] for page in self._pages.values())):
@@ -1127,7 +1368,8 @@ class App:
                 self.root.after_cancel(handle)
         self.status_var.set('Closing after background work stops…')
         self._refresh_buttons()
-        if not self.busy and (self._page_thread is None or not self._page_thread.is_alive()):
+        if not self.busy and (self._page_thread is None or not self._page_thread.is_alive()) and not any(
+                thread.is_alive() for thread in self._background_threads.values()) and not self._background_pending:
             if self._poll_after:
                 self.root.after_cancel(self._poll_after)
             self.root.destroy()

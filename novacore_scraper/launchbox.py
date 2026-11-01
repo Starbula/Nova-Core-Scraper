@@ -6,7 +6,6 @@ old one, which remains usable when a refresh fails.
 """
 from __future__ import annotations
 
-import json
 import zlib
 from contextlib import closing
 import os
@@ -26,14 +25,15 @@ from xml.sax.handler import ContentHandler, feature_external_ges, feature_extern
 import requests
 
 from .models import Artwork, Game
-from .providers import CACHE_SECONDS, Cancelled, Checkpoint, ProviderError, _Provider, _name_info, _region, _requested
+from .providers import CACHE_SECONDS, Cancelled, Checkpoint, ProviderError, _Provider, _region
+from .matching import MatchPolicy, match_note, region_rank, requested_info, title_info
 
 CATALOGUE_URL = 'https://gamesdb.launchbox-app.com/Metadata.zip'
 IMAGE_BASE_URL = 'https://images.launchbox-app.com/'
 MAX_CATALOGUE_BYTES = 256 * 1024 * 1024
 MAX_XML_BYTES = 1024 * 1024 * 1024
 MAX_FIELD_CHARS = 4096
-_INDEX_VERSION = 1
+_INDEX_VERSION = 2
 _FILENAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_. -]{0,199}\.(?:png|jpe?g|webp)', re.IGNORECASE)
 
 # Exact export platform names. Aliases share a platform only when the console is
@@ -85,10 +85,6 @@ def _image_region(value: str) -> str:
     return {'North America': 'us', 'Oceania': 'au', 'The Netherlands': 'nl',
             'Hong Kong': 'hk', 'Sweden': 'se', 'Russia': 'ru', 'Norway': 'no',
             'Finland': 'fi', 'Greece': 'gr', 'South America': 'sa'}.get(value, _region(value))
-
-
-def _qualifiers(values: tuple[str, ...]) -> str:
-    return json.dumps(values, ensure_ascii=False, separators=(',', ':'))
 
 
 def _check_archive_directory(path):
@@ -199,7 +195,7 @@ class _CatalogueHandler(ContentHandler):
             name, platform = data.get('Name', ''), data.get('Platform', '')
             if name and platform:
                 self.connection.execute('INSERT INTO games VALUES (?, ?, ?)',
-                                        (database_id, platform, _qualifiers(_name_info(name)[2])))
+                                        (database_id, platform, name))
                 self._name(database_id, name)
                 self.games += 1
         elif self.kind == 'GameAlternateName' and data.get('AlternateName'):
@@ -211,16 +207,18 @@ class _CatalogueHandler(ContentHandler):
                                         (database_id, filename, _image_region(data.get('Region', ''))))
 
     def _name(self, database_id, name):
-        base, _, qualifiers = _name_info(name)
-        if base:
-            self.connection.execute('INSERT INTO names VALUES (?, ?, ?)', (database_id, base, _qualifiers(qualifiers)))
+        info = title_info(name)
+        if info.key:
+            self.connection.execute('INSERT INTO names VALUES (?, ?, ?)', (database_id, info.key, name))
 
 
 class LaunchBoxProvider(_Provider):
     name = 'LaunchBox'
 
-    def __init__(self, cache_dir: Path, region: str = 'eu', interval: float = .25, workers: int = 8):
+    def __init__(self, cache_dir: Path, region: str = 'eu', interval: float = .25, workers: int = 8,
+                 match_policy: MatchPolicy | None = None):
         super().__init__(cache_dir, region, interval, workers)
+        self.match_policy = match_policy or MatchPolicy()
         self.interval = max(.5, self.interval)
         self._index = self.cache_dir / 'launchbox-v1.sqlite3'
         self._prepare_lock = threading.Lock()
@@ -257,9 +255,9 @@ class LaunchBoxProvider(_Provider):
                     return False
                 if connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                     return False
-                connection.execute('SELECT game_id, base, qualifiers FROM names LIMIT 1').fetchone()
+                connection.execute('SELECT game_id, base, name FROM names LIMIT 1').fetchone()
                 connection.execute('SELECT game_id, filename, region FROM images LIMIT 1').fetchone()
-                return connection.execute('SELECT qualifiers FROM games LIMIT 1').fetchone() is not None
+                return connection.execute('SELECT name FROM games LIMIT 1').fetchone() is not None
         except (sqlite3.Error, OSError, ValueError):
             return False
 
@@ -352,8 +350,8 @@ class LaunchBoxProvider(_Provider):
             connection.execute('PRAGMA journal_mode=OFF')
             connection.execute('PRAGMA synchronous=OFF')
             connection.execute('PRAGMA temp_store=FILE')
-            connection.executescript('CREATE TABLE games (game_id INTEGER PRIMARY KEY, platform TEXT NOT NULL, qualifiers TEXT NOT NULL);'
-                                     'CREATE TABLE names (game_id INTEGER, base TEXT, qualifiers TEXT);'
+            connection.executescript('CREATE TABLE games (game_id INTEGER PRIMARY KEY, platform TEXT NOT NULL, name TEXT NOT NULL);'
+                                     'CREATE TABLE names (game_id INTEGER, base TEXT, name TEXT);'
                                      'CREATE TABLE images (game_id INTEGER, filename TEXT, region TEXT);')
             _check_archive_directory(archive_path)
             with zipfile.ZipFile(archive_path) as archive:
@@ -386,7 +384,7 @@ class LaunchBoxProvider(_Provider):
                 return 0
             connection.set_progress_handler(progress, 10000)
             try:
-                connection.executescript('CREATE INDEX names_lookup ON names (base, qualifiers, game_id);'
+                connection.executescript('CREATE INDEX names_lookup ON names (base, game_id);'
                                          'CREATE INDEX images_lookup ON images (game_id);'
                                          'CREATE INDEX games_platform ON games (platform, game_id);')
             except sqlite3.Error:
@@ -402,37 +400,64 @@ class LaunchBoxProvider(_Provider):
             connection.close()
 
     def find(self, game: Game, checkpoint: Checkpoint) -> Artwork | None:
+        return next(self.candidates(game, checkpoint), None)
+
+    def candidates(self, game: Game, checkpoint: Checkpoint):
         checkpoint()
         platform = LAUNCHBOX_SYSTEMS.get(game.system.name.casefold())
         if platform is None and game.system.fullname in LAUNCHBOX_SYSTEMS.values():
             platform = game.system.fullname
         if platform is None:
+            self._unmatched('unsupported_platform', 'LaunchBox has no verified platform mapping for this system.')
             return None
         self.prepare(checkpoint)
-        names, _, explicit_regions, qualifiers = _requested(game)
-        bases = list(dict.fromkeys(_name_info(name)[0] for name in names))
+        requested = requested_info(game)
         try:
             with closing(self._connect()) as connection:
-                ids = connection.execute(
-                    'SELECT DISTINCT games.game_id FROM names JOIN games USING (game_id) '
-                    'WHERE games.platform=? AND games.qualifiers=? AND names.qualifiers=? AND names.base IN (' + ','.join('?' for _ in bases) + ') LIMIT 2',
-                    (platform, _qualifiers(qualifiers), _qualifiers(qualifiers), *bases)).fetchall()
-                # Resolve identity before inspecting artwork or regional preferences.
-                if len(ids) != 1:
+                candidates = connection.execute(
+                    'SELECT DISTINCT games.game_id, games.name, names.name FROM names JOIN games USING (game_id) '
+                    'WHERE games.platform=? AND names.base=?', (platform, requested.key)).fetchall()
+                matches = {}
+                for game_id, canonical_name, alias in candidates:
+                    canonical, alternate = title_info(canonical_name), title_info(alias)
+                    # A verified alias cannot erase a hack, prototype, edition,
+                    # or other meaningful qualifier on its canonical game.
+                    if canonical.key != requested.key and canonical.qualifiers != requested.qualifiers:
+                        continue
+                    if not self.match_policy.allow_base_cover and (
+                            canonical.packaging != requested.packaging or alternate.packaging != requested.packaging):
+                        continue
+                    choice = (alternate.packaging != requested.packaging, alias, canonical)
+                    if game_id not in matches or choice[:2] < matches[game_id][:2]:
+                        matches[game_id] = choice
+                # Identity is settled before inspecting image availability or region.
+                if len(matches) != 1:
+                    self._unmatched('ambiguous_title' if matches else 'no_title_match',
+                                    'Several LaunchBox game IDs share this title; review is required.' if matches
+                                    else 'No exact title or verified alias matches this LaunchBox platform.')
                     return None
-                rows = connection.execute('SELECT filename, region FROM images WHERE game_id=? ORDER BY filename', ids[0]).fetchall()
+                game_id, (_, alias, candidate) = next(iter(matches.items()))
+                rows = connection.execute('SELECT filename, region FROM images WHERE game_id=? ORDER BY filename', (game_id,)).fetchall()
         except sqlite3.Error:
             raise ProviderError('The cached LaunchBox catalogue could not be read. Try again.') from None
         checkpoint()
-        if explicit_regions:
-            rows = [row for row in rows if row[1] in explicit_regions or row[1] == 'wor']
-        if not rows:
+        ranked = []
+        for filename, region in rows:
+            rank = region_rank(region, requested.regions, self.region, self.match_policy)
+            if rank is not None:
+                ranked.append((rank, filename, region))
+        if not ranked:
+            self._unmatched('no_front_cover', 'The exact LaunchBox game has no front cover allowed by the region policy.')
             return None
-        # Multiple images of the same proven game are safe variants, not title guesses.
-        rows.sort(key=lambda row: (0 if row[1] in explicit_regions else 1,
-                                   0 if row[1] == self.region else 1,
-                                   0 if row[1] == 'wor' else 1, 0 if not row[1] else 1, row[0]))
-        filename, region = rows[0]
-        if not _safe_filename(filename):
-            raise ProviderError('The cached LaunchBox catalogue contains an unsafe artwork filename.')
-        return Artwork(IMAGE_BASE_URL + filename.replace(' ', '%20'), self.name, region)
+        # Multiple covers are safe variants once the canonical game ID is unique.
+        seen = set()
+        for _, filename, region in sorted(ranked):
+            checkpoint()
+            if filename in seen:
+                continue
+            seen.add(filename)
+            if not _safe_filename(filename):
+                raise ProviderError('The cached LaunchBox catalogue contains an unsafe artwork filename.')
+            yield Artwork(IMAGE_BASE_URL + filename.replace(' ', '%20'), self.name, region,
+                          match_note=match_note(requested, candidate, region), matched_title=alias,
+                          provider_game_id=str(game_id))

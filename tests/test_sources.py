@@ -152,3 +152,84 @@ def test_prepare_cancellation_keeps_other_source_untouched():
         chain.prepare(lambda: None)
     assert not chain._prepared
     assert not chain._disabled
+
+
+def test_nested_candidates_try_each_region_without_calling_find(tmp_path):
+    class Regional(Stub):
+        def candidates(self, game, checkpoint):
+            yield Artwork('https://example/us.png', self.name, 'us')
+            yield Artwork('https://example/eu.png', self.name, 'eu')
+        def find(self, *_):
+            raise AssertionError('nested candidates must be preserved')
+    provider = Regional('GameTDB')
+    chain = FallbackProvider([provider])
+    matches = list(chain.candidates(object(), lambda: None))
+    assert [art.region for art in matches] == ['us', 'eu']
+    for art in matches:
+        chain.download(art, tmp_path/'cover.png', lambda: None)
+    assert len(provider.downloads) == 2
+
+
+def test_transient_host_circuit_cools_down_then_recovers_without_hiding_fallback():
+    now = [0.0]
+    first = Stub('Libretro', find_error=ProviderError('Network request failed after several attempts.'))
+    second = Stub('LaunchBox', Artwork('https://example/good.png', 'LaunchBox'))
+    chain = FallbackProvider([first, second], cooldown=30, clock=lambda: now[0])
+    for _ in range(12):
+        assert chain.find(object(), lambda: None) == second.result
+    assert first.lookups == 1
+    first.find_error = None
+    first.result = Artwork('https://example/recovered.png', 'Libretro')
+    now[0] = 30
+    assert chain.find(object(), lambda: None) == first.result
+    assert first.lookups == 2
+
+
+def test_missing_diagnostics_distinguish_ambiguous_and_unsupported():
+    first = Stub('GameTDB')
+    first.missing_reason = lambda game=None: ('unsupported_system', 'This platform is not supported.')
+    second = Stub('TheGamesDB')
+    second.missing_reason = lambda game=None: ('ambiguous', 'Several editions share this title.')
+    chain = FallbackProvider([first, second])
+    assert chain.find(object(), lambda: None) is None
+    code, detail = chain.missing_reason()
+    assert code == 'ambiguous'
+    assert 'Several editions' in detail
+
+
+def test_unexpected_broken_source_cannot_block_a_healthy_fallback_or_leak_secrets():
+    first = Stub('Libretro')
+    def broken(*args):
+        raise RuntimeError('bad response https://example/?password=secret')
+    first.find = broken
+    second = Stub('LaunchBox', Artwork('https://example/cover.png', 'LaunchBox'))
+    chain = FallbackProvider([first, second])
+    candidates = chain.candidates(object(), lambda: None)
+    assert next(candidates) == second.result
+    with pytest.raises(ProviderError) as error:
+        next(candidates)
+    assert 'password' not in str(error.value) and 'secret' not in str(error.value)
+
+
+def test_prepare_failure_can_recover_after_cooldown():
+    now = [0.0]
+    first = Stub('Libretro', prepare_error=ProviderError('Network request failed after several attempts.'))
+    second = Stub('LaunchBox', Artwork('https://example/cover.png', 'LaunchBox'))
+    chain = FallbackProvider([first, second], cooldown=30, clock=lambda: now[0])
+    assert chain.find(object(), lambda: None) == second.result
+    first.prepare_error = None
+    first.result = Artwork('https://example/recovered.png', 'Libretro')
+    now[0] = 30
+    assert chain.find(object(), lambda: None) == first.result
+
+
+def test_file_exists_from_publication_is_preserved_without_a_source_circuit(tmp_path):
+    source = Stub('Libretro', Artwork('https://example/cover.png', 'Libretro'))
+    def another_writer(*args):
+        raise FileExistsError('Another writer published the artwork.')
+    source.download = another_writer
+    chain = FallbackProvider([source])
+    artwork = chain.find(object(), lambda: None)
+    with pytest.raises(FileExistsError):
+        chain.download(artwork, tmp_path/'cover.png', lambda: None)
+    assert not chain._errors and not chain._disabled and not chain._cooldowns

@@ -15,7 +15,7 @@ class SettingsTests(unittest.TestCase):
                 save_settings(Settings(workers=2,selected_systems=['nes']))
                 self.assertEqual(load_settings().selected_systems,['nes'])
                 text=(directory/'settings.json').read_text()
-                self.assertEqual(json.loads(text)['version'],2)
+                self.assertEqual(json.loads(text)['version'],3)
                 self.assertNotIn('password',text)
                 self.assertNotIn('devid',text)
     def test_bad_settings_fall_back_and_limit_concurrency(self):
@@ -55,3 +55,18 @@ class SettingsTests(unittest.TestCase):
                         save_settings(Settings(provider=provider,workers=16,interval=.25))
                         settings=load_settings()
                         self.assertEqual((settings.provider,settings.workers,settings.interval),(provider,16,.25))
+
+    def test_overnight_policies_and_all_source_modes_round_trip_without_secrets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            with patch('novacore_scraper.settings.data_directory', return_value=directory):
+                for provider in ('gametdb', 'thegamesdb', 'igdb', 'mobygames'):
+                    settings = Settings(provider=provider, allow_other_regions=False, allow_base_cover=False,
+                                        retry_failed=False, keep_awake=False, remember_credentials=False)
+                    save_settings(settings)
+                    loaded = load_settings()
+                    self.assertEqual(loaded.provider, provider)
+                    self.assertFalse(any((loaded.allow_other_regions, loaded.allow_base_cover,
+                                          loaded.retry_failed, loaded.keep_awake, loaded.remember_credentials)))
+                raw = json.loads((directory/'settings.json').read_text())
+                self.assertFalse(any('key' in field or 'secret' in field or 'password' in field for field in raw))

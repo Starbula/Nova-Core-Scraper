@@ -10,7 +10,6 @@ import io
 import json
 import math
 import os
-import re
 import tempfile
 import threading
 import time
@@ -29,6 +28,8 @@ import requests
 from PIL import Image, UnidentifiedImageError
 
 from .models import Artwork, Game
+from .matching import (MatchPolicy, match_note, match_title, match_titles, region_key, region_rank,
+                       requested_info, title_info)
 
 Checkpoint = Callable[[], None]
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -40,6 +41,10 @@ CACHE_SECONDS = 7 * 24 * 3600
 
 class ProviderError(RuntimeError):
     """A provider could not complete a request; message is safe for the UI."""
+
+
+class ArtworkUnavailable(ProviderError):
+    """A listed image is absent; trying another source/region can still succeed."""
 
 
 class AuthenticationError(ProviderError):
@@ -91,17 +96,6 @@ LIBRETRO_SYSTEMS = {
     'atomiswave': 'Atomiswave', 'scummvm': 'ScummVM', 'dos': 'DOS', 'supervision': 'Watara - Supervision',
 }
 
-_REGION_ALIASES = {
-    'eu': 'eu', 'europe': 'eu', 'european': 'eu', 'pal': 'eu',
-    'us': 'us', 'usa': 'us', 'united states': 'us', 'ntsc-u': 'us',
-    'jp': 'jp', 'japan': 'jp', 'japanese': 'jp', 'ntsc-j': 'jp',
-    'wor': 'wor', 'world': 'wor', 'fr': 'fr', 'france': 'fr', 'de': 'de', 'germany': 'de',
-    'es': 'es', 'spain': 'es', 'it': 'it', 'italy': 'it', 'uk': 'uk', 'united kingdom': 'uk',
-    'au': 'au', 'australia': 'au', 'ca': 'ca', 'canada': 'ca', 'br': 'br', 'brazil': 'br',
-    'kr': 'kr', 'korea': 'kr', 'cn': 'cn', 'china': 'cn', 'tw': 'tw', 'taiwan': 'tw', 'asia': 'asi', 'asi': 'asi',
-}
-_TAGS = re.compile(r'\(([^()]*)\)|\[([^\[\]]*)\]')
-_GOODTOOLS_REGIONS = {'u': 'us', 'e': 'eu', 'j': 'jp'}
 
 
 def _normal(value: str) -> str:
@@ -109,58 +103,24 @@ def _normal(value: str) -> str:
 
 
 def _region(value: str) -> str:
-    return _REGION_ALIASES.get(_normal(value), _normal(value))
+    return region_key(value)
 
 
 def _name_info(value: str) -> tuple[str, set[str], tuple[str, ...]]:
-    regions: set[str] = set()
-    qualifiers = []
-    for match in _TAGS.finditer(value):
-        tag = _normal(match.group(1) or match.group(2) or '')
-        if not tag or (match.group(2) is not None and tag == '!'):
-            continue
-        parts = [part.strip() for part in re.split(r'[,/]', tag)]
-        if parts and all(part in _REGION_ALIASES for part in parts):
-            regions.update(_REGION_ALIASES[part] for part in parts)
-        elif (re.fullmatch(r'[uej]{1,3}', tag) and len(set(tag)) == len(tag)):
-            regions.update(_GOODTOOLS_REGIONS[letter] for letter in tag)
-        elif re.fullmatch(r'[a-z]{2}(?:,[a-z]{2})*', tag) and all(part in {'en', 'fr', 'de', 'es', 'it', 'ja', 'pt', 'nl', 'sv', 'zh', 'ko'} for part in parts):
-            continue
-        else:
-            qualifiers.append(tag)
-    return _normal(_TAGS.sub('', value)), regions, tuple(sorted(qualifiers))
+    info = title_info(value)
+    return info.key, set(info.regions), info.qualifiers + info.packaging
 
 
 def _requested(game: Game) -> tuple[list[str], str, set[str], tuple[str, ...]]:
     names = list(dict.fromkeys([game.path.stem, game.title]))
-    base, _, title_qualifiers = _name_info(game.title)
-    _, file_regions, file_qualifiers = _name_info(game.path.stem)
-    _, title_regions, _ = _name_info(game.title)
-    return names, base, file_regions or title_regions, file_qualifiers or title_qualifiers
+    info = requested_info(game)
+    return names, info.key, set(info.regions), info.qualifiers + info.packaging
 
 
-def _choose_name(names: list[str], game: Game, preference: str) -> str | None:
-    wanted, base, explicit_regions, qualifiers = _requested(game)
-    for exact in wanted:
-        matches = [name for name in names if _normal(name) == _normal(exact)]
-        if len(matches) == 1:
-            _, regions, candidate_qualifiers = _name_info(matches[0])
-            if candidate_qualifiers == qualifiers and (not explicit_regions or regions & explicit_regions):
-                return matches[0]
-    matches = []
-    for name in names:
-        candidate_base, regions, candidate_qualifiers = _name_info(name)
-        if candidate_base != base or candidate_qualifiers != qualifiers:
-            continue
-        if explicit_regions and not regions & explicit_regions:
-            continue
-        matches.append(name)
-    preferred = [name for name in matches if preference in _name_info(name)[1]]
-    if len(preferred) == 1:
-        return preferred[0]
-    if len(matches) == 1:
-        return matches[0]
-    return None
+def _choose_name(names: list[str], game: Game, preference: str,
+                 policy: MatchPolicy | None = None) -> str | None:
+    match = match_title(names, game, policy, preference)
+    return match.name if match else None
 
 
 class _Links(HTMLParser):
@@ -202,6 +162,13 @@ class _Provider:
     def prepare(self, checkpoint: Checkpoint) -> None:
         checkpoint()
         self._check_fatal()
+
+    def _unmatched(self, code: str, message: str):
+        self._local.reason = (code, message)
+        return None
+
+    def missing_reason(self, game=None) -> tuple[str, str]:
+        return getattr(self._local, 'reason', ('no_title_match', 'No matching game was found in this source.'))
 
     def close(self) -> None:
         with self._sessions_lock:
@@ -294,7 +261,11 @@ class _Provider:
             except (TypeError, ValueError, OverflowError):
                 return 0.5 * (2 ** attempt)
 
-    def _request(self, url: str, checkpoint: Checkpoint, params=None, missing_ok=False):
+    def _request(self, url: str, checkpoint: Checkpoint, params=None, missing_ok=False,
+                 *, method='GET', data=None, headers=None, accepted_status=()):
+        method = str(method).upper()
+        if method not in {'GET', 'POST'}:
+            raise ProviderError('The provider requested an unsupported operation.')
         self._trusted(url)
         checkpoint()
         self._check_fatal()
@@ -310,7 +281,7 @@ class _Provider:
                     self._trusted(current)
                     try:
                         session = self._session()
-                        prepared = session.prepare_request(requests.Request('GET', current, params=params))
+                        prepared = session.prepare_request(requests.Request(method, current, params=params, data=data, headers=headers))
                         settings = session.merge_environment_settings(prepared.url, {}, True, None, None)
                         # Preparation can block or finish out of order. Reserve
                         # rate/quota only when the prepared request is ready to send.
@@ -327,16 +298,24 @@ class _Provider:
                     if status in (301, 302, 303, 307, 308):
                         location = response.headers.get('Location', '')
                         response.close()
+                        target = urljoin(current, location)
+                        if method != 'GET' or ((params or headers or urlsplit(current).query)
+                                              and urlsplit(target).netloc != urlsplit(current).netloc):
+                            raise ProviderError('The provider returned an unsafe authenticated redirect.')
                         redirects += 1
                         if not location or redirects > 4:
                             raise ProviderError('The provider returned an invalid redirect.')
-                        current = urljoin(current, location)
+                        current = target
                         params = None
                         continue
                     break
                 if response is None:
                     continue
                 status = response.status_code
+                if status in accepted_status:
+                    response._novacore_slot = self._slots
+                    retained = True
+                    return response
                 if status == 429 or 500 <= status <= 599:
                     delay = self._retry_delay(response, attempt)
                     response.close()
@@ -355,6 +334,9 @@ class _Provider:
                 if status == 404 and missing_ok:
                     response.close()
                     return None
+                if status == 404:
+                    response.close()
+                    raise ArtworkUnavailable('The artwork is no longer available.')
                 if status != 200:
                     response.close()
                     messages = {401: 'The provider is temporarily closed to this account.', 423: 'The provider is temporarily unavailable.',
@@ -507,13 +489,15 @@ class _Provider:
 
 class LibretroProvider(_Provider):
     """Public, filename-based Named_Boxarts; no account or API key needed."""
-    def __init__(self, cache_dir: Path, region: str = 'eu', interval: float = 1.0, workers: int = 2):
+    def __init__(self, cache_dir: Path, region: str = 'eu', interval: float = 1.0, workers: int = 2,
+                 match_policy: MatchPolicy | None = None):
         super().__init__(cache_dir, region, interval, min(8, int(workers)))
+        self.match_policy = match_policy or MatchPolicy()
         # NovaCore's conservative public traffic policy, not a published quota.
         self.interval = max(0.25, self.interval)
         self._catalogs: dict[str, list[str]] = {}
         self._catalog_lock = threading.Lock()
-        self._indexes: dict[str, tuple[dict[str, list[str]], dict[str, list[str]]]] = {}
+        self._indexes: dict[str, dict[str, list[str]]] = {}
         self._index_lock = threading.Lock()
 
     def _trusted_host(self, host):
@@ -559,34 +543,39 @@ class LibretroProvider(_Provider):
             return names
 
     def find(self, game: Game, checkpoint: Checkpoint) -> Artwork | None:
+        return next(self.candidates(game, checkpoint), None)
+
+    def candidates(self, game: Game, checkpoint: Checkpoint):
         checkpoint()
         platform = LIBRETRO_SYSTEMS.get(game.system.name.casefold())
         if platform is None and game.system.fullname in LIBRETRO_SYSTEMS.values():
             platform = game.system.fullname
         if platform is None:
+            self._unmatched('unsupported_platform', 'Libretro has no artwork catalogue for this platform.')
             return None
         names = self._catalog(platform, checkpoint)
         with self._index_lock:
             if platform not in self._indexes:
-                exact: dict[str, list[str]] = {}
                 bases: dict[str, list[str]] = {}
                 for index, name in enumerate(names):
                     if index % 256 == 0:
                         checkpoint()
-                    exact.setdefault(_normal(name), []).append(name)
                     bases.setdefault(_name_info(name)[0], []).append(name)
-                self._indexes[platform] = exact, bases
-            exact, bases = self._indexes[platform]
-        wanted, base, _, _ = _requested(game)
-        candidates = list(bases.get(base, []))
-        for name in wanted:
-            candidates.extend(exact.get(_normal(name), []))
-        match = _choose_name(list(dict.fromkeys(candidates)), game, self.region)
-        if match is None:
+                self._indexes[platform] = bases
+            bases = self._indexes[platform]
+        requested = requested_info(game)
+        candidates = bases.get(requested.key, [])
+        found = False
+        for match in match_titles(candidates, game, self.match_policy, self.region):
+            checkpoint()
+            found = True
+            yield Artwork('https://thumbnails.libretro.com/' + quote(platform, safe='') + '/Named_Boxarts/' + quote(match.name + '.png', safe=''),
+                          'Libretro', match.region, match_note=match.note, matched_title=match.name)
+        if not found:
+            code = 'cover_policy' if candidates else 'no_title_match'
+            self._unmatched(code, 'No exact title cover satisfies the selected region and revision policy.' if candidates
+                            else 'No exact title appears in the Libretro catalogue for this platform.')
             return None
-        regions = _name_info(match)[1]
-        region = self.region if self.region in regions else next(iter(sorted(regions)), '')
-        return Artwork('https://thumbnails.libretro.com/' + quote(platform, safe='') + '/Named_Boxarts/' + quote(match + '.png', safe=''), 'Libretro', region)
 
 
 class ScreenScraperProvider(_Provider):
@@ -594,8 +583,10 @@ class ScreenScraperProvider(_Provider):
     _BASE = 'https://api.screenscraper.fr/api2/'
 
     def __init__(self, cache_dir: Path, devid: str, devpassword: str, username: str, password: str,
-                 region: str = 'eu', interval: float = 1.0, workers: int = 1):
+                 region: str = 'eu', interval: float = 1.0, workers: int = 1,
+                 match_policy: MatchPolicy | None = None):
         super().__init__(cache_dir, region, interval, workers)
+        self.match_policy = match_policy or MatchPolicy()
         self._credentials = {'devid': devid, 'devpassword': devpassword, 'ssid': username, 'sspassword': password,
                              'softname': 'NovaCoreArtworkScraper', 'output': 'json'}
         self._prepared = False
@@ -702,54 +693,81 @@ class ScreenScraperProvider(_Provider):
             self._prepared = True
 
     def find(self, game: Game, checkpoint: Checkpoint) -> Artwork | None:
+        return next(self.candidates(game, checkpoint), None)
+
+    def candidates(self, game: Game, checkpoint: Checkpoint):
         self.prepare(checkpoint)
         identifier = game.system.screenscraper_id or self._system_ids.get(_normal(game.system.name)) or self._system_ids.get(_normal(game.system.fullname))
         if identifier is None or not str(identifier).isdigit():
-            return None
-        _, base, explicit_regions, qualifiers = _requested(game)
-        # Remove region/language metadata while preserving meaningful title text.
-        def title_tag(match):
-            _, regions, tags = _name_info(match.group(0))
-            return match.group(0) if tags and not regions else ''
-        query = ' '.join(_TAGS.sub(title_tag, game.title).split())
-        data = self._json('jeuRecherche.php', checkpoint, systemeid=str(identifier), recherche=query)
+            self._unmatched('unsupported_platform', 'ScreenScraper has no verified ID for this platform.')
+            return
+        requested = requested_info(game)
+        data = self._json('jeuRecherche.php', checkpoint, systemeid=str(identifier), recherche=requested.title)
         games = data.get('jeux', [])
         if not isinstance(games, list):
             raise ProviderError('The provider returned an invalid game search.')
-        matches = []
+        grouped = {}
         for entry in games:
             if not isinstance(entry, dict):
                 continue
             system = entry.get('systeme', {})
             if not isinstance(system, dict) or str(system.get('id', '')) != str(identifier):
                 continue
-            names = entry.get('noms', [])
-            if not isinstance(names, list) or not any(
-                isinstance(name, dict)
-                and _name_info(str(name.get('text', '')))[0] == base
-                and _name_info(str(name.get('text', '')))[2] == qualifiers
-                for name in names
-            ):
+            game_id = str(entry.get('id', ''))
+            if not game_id.isascii() or not game_id.isdecimal():
                 continue
-            matches.append(entry)
-        # More than one distinct game with an identical name is review work.
+            names, media = grouped.setdefault(game_id, ([], []))
+            entry_names = entry.get('noms', [])
+            if isinstance(entry_names, list):
+                names.extend((str(name.get('text', '')), title_info(str(name.get('text', ''))))
+                             for name in entry_names if isinstance(name, dict))
+            entry_media = entry.get('medias', [])
+            if isinstance(entry_media, list):
+                media.extend(entry_media)
+        matches = {}
+        for game_id, (names, media) in grouped.items():
+            checkpoint()
+            # All qualified aliases must agree on the game's qualifier identity.
+            # A full qualified title may differ only in parenthetical typography;
+            # a separate plain alias cannot hide or combine edition qualifiers.
+            qualified = [info for _, info in names if info.qualifiers]
+            qualifier_sets = {frozenset(info.qualifiers) for info in qualified}
+            if len(qualifier_sets) > 1:
+                continue
+            qualifiers = next(iter(qualifier_sets), frozenset())
+            full_qualified_title = any(info.key == requested.key for info in qualified)
+            if qualifiers != frozenset(requested.qualifiers) and not full_qualified_title:
+                continue
+            matching_names = [(info.packaging != requested.packaging, label, info)
+                              for label, info in names if info.key == requested.key
+                              and (self.match_policy.allow_base_cover or info.packaging == requested.packaging)]
+            if matching_names:
+                _, label, info = min(matching_names, key=lambda item: (item[0], item[1]))
+                matches[game_id] = label, info, media
+        # Resolve the game ID before considering which regional artwork exists.
         if len(matches) != 1:
-            return None
-        media = matches[0].get('medias', [])
-        if not isinstance(media, list):
-            return None
-        boxes = [item for item in media if isinstance(item, dict) and item.get('type') == 'box-2D' and item.get('url')]
-        if explicit_regions:
-            boxes = [item for item in boxes if _region(str(item.get('region', ''))) in explicit_regions]
-        preference = [self.region, 'wor', 'us', 'eu', 'jp', '']
-        for region in dict.fromkeys(preference):
-            regional = [item for item in boxes if _region(str(item.get('region', ''))) == region]
-            if len(regional) == 1:
-                url = str(regional[0]['url'])
-                self._trusted(url)
-                return Artwork(url, 'ScreenScraper', region)
-        if len(boxes) == 1:
-            url = str(boxes[0]['url'])
+            self._unmatched('ambiguous_title' if matches else 'no_title_match',
+                            'Several ScreenScraper game IDs share this title; review is required.' if matches
+                            else 'No exact title matches this ScreenScraper platform.')
+            return
+        game_id, (label, candidate, media) = next(iter(matches.items()))
+        boxes = []
+        for item in media:
+            if not isinstance(item, dict) or item.get('type') != 'box-2D' or not item.get('url'):
+                continue
+            region = _region(str(item.get('region', '')))
+            rank = region_rank(region, requested.regions, self.region, self.match_policy)
+            if rank is not None:
+                boxes.append((rank, str(item['url']), region))
+        if not boxes:
+            self._unmatched('no_front_cover', 'The exact ScreenScraper game has no front cover allowed by the region policy.')
+            return
+        seen = set()
+        for _, url, region in sorted(boxes):
+            checkpoint()
+            if url in seen:
+                continue
+            seen.add(url)
             self._trusted(url)
-            return Artwork(url, 'ScreenScraper', _region(str(boxes[0].get('region', ''))))
-        return None
+            yield Artwork(url, 'ScreenScraper', region, match_note=match_note(requested, candidate, region),
+                          matched_title=label, provider_game_id=game_id)

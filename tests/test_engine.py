@@ -589,3 +589,207 @@ class EngineTests(unittest.TestCase):
             engine.cancel_all()
             self.assertTrue(engine.wait(5))
         self.assertEqual(engine.snapshot().cancelled, 20000)
+
+    def test_transient_failures_retry_boundedly_with_unique_job_counts_and_diagnostics(self):
+        provider = FakeProvider()
+        original_find = provider.find
+        attempts = []
+        def find(game, checkpoint):
+            attempts.append(game.key)
+            if len(attempts) == 1:
+                raise ProviderError('Network request failed after several attempts. Check your connection and try again.')
+            return original_find(game, checkpoint)
+        provider.find = find
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True,
+                              retry_passes=2, retry_delay=0, keep_awake=False)
+        game = self.game('good')
+        engine.start([game])
+        self.assertTrue(engine.wait(5))
+        progress = engine.snapshot()
+        self.assertEqual((progress.total, progress.completed, progress.failed, progress.resolved), (1, 1, 0, 1))
+        job = engine.jobs_page()[0][0]
+        self.assertEqual((job.attempts, job.source, job.reason), (2, 'fixture', 'downloaded'))
+        rows, _ = State.downloaded_page(self.root)
+        self.assertEqual((rows[0]['attempts'], rows[0]['source']), (2, 'fixture'))
+
+    def test_retry_wait_can_be_cancelled_without_another_network_attempt(self):
+        provider = FakeProvider()
+        entered = threading.Event()
+        def find(game, checkpoint):
+            provider.calls.append(game.title)
+            entered.set()
+            raise ProviderError('The provider is busy. Try again later.')
+        provider.find = find
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True,
+                              retry_passes=2, retry_delay=60, keep_awake=False)
+        game = self.game('good')
+        waiting = threading.Event()
+        original_wait = engine._condition.wait
+        def observe_wait(timeout=None):
+            if engine.snapshot().stage == 'retry_wait':
+                waiting.set()
+            return original_wait(timeout)
+        engine._condition.wait = observe_wait
+        engine.start([game])
+        self.assertTrue(entered.wait(2))
+        self.assertTrue(waiting.wait(2))
+        self.assertEqual(engine.jobs_page()[0][0].status, 'retry_wait')
+        self.assertIn('Retry', engine.snapshot().message)
+        engine.cancel_jobs([game.key])
+        self.assertTrue(engine.wait(2))
+        self.assertEqual(provider.calls, ['good'])
+        self.assertEqual((engine.snapshot().cancelled, engine.snapshot().failed, engine.snapshot().resolved), (1, 0, 1))
+        rows, _ = State.jobs_page(self.root, statuses={'cancelled'})
+        self.assertEqual(len(rows), 1)
+
+    def test_terminal_missing_and_invalid_images_are_never_retried(self):
+        provider = FakeProvider()
+        def find(game, checkpoint):
+            provider.calls.append(game.title)
+            if game.title == 'invalid':
+                raise ProviderError('The provider returned an invalid or oversized image.')
+            return None
+        provider.find = find
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True,
+                              retry_passes=2, retry_delay=0, keep_awake=False)
+        engine.start([self.game('missing'), self.game('invalid')])
+        self.assertTrue(engine.wait(5))
+        self.assertCountEqual(provider.calls, ['missing', 'invalid'])
+        jobs, _ = engine.jobs_page()
+        self.assertEqual({job.reason for job in jobs}, {'no_match', 'invalid_response'})
+
+    def test_retry_limit_is_two_additional_passes_and_remaining_failures_are_reported(self):
+        provider = FakeProvider()
+        def find(game, checkpoint):
+            provider.calls.append(game.title)
+            raise ProviderError('The provider is busy. Try again later.')
+        provider.find = find
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True,
+                              retry_passes=99, retry_delay=0, keep_awake=False)
+        engine.start([self.game('good')])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual(provider.calls, ['good']*3)
+        p = engine.snapshot()
+        self.assertEqual((p.total, p.failed, p.resolved, p.processed), (1, 1, 1, 1))
+        rows, total = State.jobs_page(self.root, statuses='failed')
+        self.assertEqual((total, rows[0]['attempts'], rows[0]['retryable']), (1, 3, 1))
+        self.assertIn('1 failed', p.message)
+
+    def test_source_preparation_temporary_failure_is_retried(self):
+        provider = FakeProvider()
+        prepares = []
+        def prepare(checkpoint):
+            prepares.append(True)
+            if len(prepares) == 1:
+                raise ProviderError('Network request failed after several attempts.')
+        provider.prepare = prepare
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True,
+                              retry_passes=2, retry_delay=0, keep_awake=False)
+        engine.start([self.game('good')])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual((len(prepares), engine.snapshot().completed), (2, 1))
+        self.assertEqual(engine.jobs_page()[0][0].attempts, 2)
+
+    def test_repeat_skip_retains_completed_source_and_attempts_in_report(self):
+        game = self.game('good')
+        first = ScrapeEngine(self.root, FakeProvider(), process_running=lambda: True, keep_awake=False)
+        first.start([game])
+        self.assertTrue(first.wait(5))
+        second = ScrapeEngine(self.root, FakeProvider(), process_running=lambda: True, keep_awake=False)
+        second.start([game])
+        self.assertTrue(second.wait(5))
+        row = State.jobs_page(self.root)[0][0]
+        self.assertEqual((row['status'], row['source'], row['attempts']), ('skipped', 'fixture', 1))
+
+    def test_provider_error_urls_are_absent_from_jobs_state_and_export(self):
+        provider = FakeProvider()
+        def find(game, checkpoint):
+            raise ProviderError('Network failed at https://example.invalid/?password=private-token')
+        provider.find = find
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True,
+                              retry_passes=0, keep_awake=False)
+        engine.start([self.game('good')])
+        self.assertTrue(engine.wait(5))
+        report = self.root/'report.csv'
+        State.export_report(self.root, report)
+        self.assertNotIn('private-token', report.read_text(encoding='utf-8-sig'))
+        self.assertNotIn('https://', engine.jobs_page()[0][0].detail)
+
+    def test_stop_before_a_retry_requeue_retains_the_failed_result(self):
+        provider = FakeProvider()
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True,
+                              retry_passes=2, retry_delay=0, keep_awake=False)
+        original_requeue = engine._requeue
+        def stop_before_requeue(games):
+            engine.stop()
+            original_requeue(games)
+        engine._requeue = stop_before_requeue
+        def find(game, checkpoint):
+            provider.calls.append(game.title)
+            raise ProviderError('The provider is busy. Try again later.')
+        provider.find = find
+        engine.start([self.game('good')])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual((engine.snapshot().failed, engine.snapshot().cancelled), (1, 0))
+        self.assertEqual(provider.calls, ['good'])
+
+    def test_transient_download_is_retried_when_later_source_lookup_latches_auth_failure(self):
+        from novacore_scraper.providers import AuthenticationError
+        from novacore_scraper.sources import FallbackProvider
+        now = [0.0]
+        class Recovering(FakeProvider):
+            name = 'Libretro'
+            def __init__(self):
+                super().__init__()
+                self.download_attempts = 0
+            def find(self, game, checkpoint):
+                self.calls.append(game.title)
+                return Artwork('https://example.invalid/cover.png', self.name)
+            def download(self, artwork, destination, checkpoint):
+                self.download_attempts += 1
+                if self.download_attempts == 1:
+                    raise ProviderError('Network request failed after several attempts.')
+                super().download(artwork, destination, checkpoint)
+        class Rejected(FakeProvider):
+            name = 'LaunchBox'
+            def find(self, game, checkpoint):
+                self.calls.append(game.title)
+                now[0] = 30.0
+                raise AuthenticationError('Credentials were rejected.')
+        recovering, rejected = Recovering(), Rejected()
+        chain = FallbackProvider([recovering, rejected], workers=1, cooldown=30, clock=lambda: now[0])
+        engine = ScrapeEngine(self.root, chain, process_running=lambda: True,
+                              retry_passes=2, retry_delay=0, keep_awake=False)
+        engine.start([self.game('good')])
+        self.assertTrue(engine.wait(5))
+        p = engine.snapshot()
+        self.assertEqual((p.completed, p.failed, p.resolved, p.processed), (1, 0, 1, 1))
+        self.assertEqual((recovering.download_attempts, len(rejected.calls)), (2, 1))
+        self.assertEqual(engine.jobs_page()[0][0].attempts, 2)
+
+    def test_fallback_preserves_competing_publication_as_skipped_with_pending_metadata(self):
+        from novacore_scraper.sources import FallbackProvider
+        class OtherWriter(FakeProvider):
+            name = 'Libretro'
+            def find(self, game, checkpoint):
+                return Artwork('https://example.invalid/cover.png', self.name)
+            def download(self, artwork, destination, checkpoint):
+                super().download(artwork, destination, checkpoint)
+                raise FileExistsError('Another writer published the artwork.')
+        source = OtherWriter()
+        chain = FallbackProvider([source], workers=1)
+        engine = ScrapeEngine(self.root, chain, process_running=lambda: True,
+                              retry_passes=2, retry_delay=0, keep_awake=False)
+        game = self.game('good')
+        engine.start([game])
+        self.assertTrue(engine.wait(5))
+        p = engine.snapshot()
+        self.assertEqual((p.completed, p.skipped, p.failed, p.pending), (0, 1, 0, 1))
+        self.assertEqual(engine.artwork_counts(), {'nes': 1})
+        job = engine.jobs_page()[0][0]
+        self.assertTrue(Path(job.artwork).is_file())
+        self.assertEqual((job.reason, job.source), ('existing_artwork', 'Libretro'))
+        with State(self.root) as state:
+            self.assertEqual(len(state.pending()), 1)
+        self.assertEqual(chain._cooldowns, {})
+        self.assertEqual(chain._disabled, {})

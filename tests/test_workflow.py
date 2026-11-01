@@ -14,6 +14,9 @@ from novacore_scraper.engine import ScrapeEngine
 from novacore_scraper.settings import Settings
 from novacore_scraper.providers import ProviderError
 from novacore_scraper.sources import FallbackProvider
+from novacore_scraper.providers import ArtworkUnavailable
+from novacore_scraper.state import State
+import csv
 
 
 class FixtureProvider:
@@ -196,3 +199,56 @@ class WorkflowTests(unittest.TestCase):
         self.pump(lambda: not self.app.engine.active)
         self.assertEqual((self.app.engine.snapshot().skipped, self.app.engine.snapshot().completed), (3, 0))
         self.assertEqual((len(first.games), len(second.games)), (3, 2))
+
+    def test_unattended_seven_source_run_preserves_scope_reports_and_match_notes(self):
+        names = ('Libretro', 'LaunchBox', 'GameTDB', 'TheGamesDB', 'IGDB', 'MobyGames', 'ScreenScraper')
+        class Layer(FixtureProvider):
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+                self.downloads = []
+            def candidates(self, game, checkpoint):
+                checkpoint()
+                self.games.append(game)
+                if game.title == 'Game 0' and self.name == 'ScreenScraper':
+                    yield Artwork('https://example.invalid/last-source.png', self.name, 'eu', matched_title=game.title)
+                elif game.title == 'Game 2' and self.name == 'Libretro':
+                    yield Artwork('https://example.invalid/removed.png', self.name, 'eu')
+                    yield Artwork('https://example.invalid/backup.png', self.name, 'us',
+                                  match_note='Other-region cover: US; requested EU.', matched_title=game.title)
+            def missing_reason(self, game):
+                return ('ambiguous_title', 'Multiple verified game IDs require review.') if self.name == 'LaunchBox' else ('no_title_match', 'No matching title.')
+            def download(self, artwork, destination, checkpoint):
+                self.downloads.append(artwork.url)
+                if artwork.url.endswith('/removed.png'):
+                    raise ArtworkUnavailable('The listed artwork is absent.')
+                super().download(artwork, destination, checkpoint)
+            def close(self):
+                pass
+        layers = [Layer(name) for name in names]
+        self.app.select_console('gba')
+        with patch.object(self.app, '_make_provider', return_value=FallbackProvider(layers, workers=8)):
+            self.app.start()
+        self.pump(lambda: self.app.engine is not None and not self.app.engine.active)
+        self.pump(lambda: self.app._existing_counts.get('gba') == 2)
+        progress = self.app.engine.snapshot()
+        self.assertEqual((progress.total, progress.completed, progress.missing, progress.failed), (3, 2, 1, 0))
+        jobs, _ = self.app.engine.jobs_page()
+        by_title = {job.title: job for job in jobs}
+        self.assertEqual(by_title['Game 0'].source, 'ScreenScraper')
+        self.assertEqual(by_title['Game 1'].reason, 'ambiguous_title')
+        self.assertIn('Other-region', by_title['Game 2'].match_note)
+        self.assertEqual(len(layers[0].downloads), 2)
+        report = self.root/'artwork-results.csv'
+        self.assertEqual(State.export_report(self.root, report), 3)
+        with report.open(encoding='utf-8-sig', newline='') as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(any('Other-region' in str(row) for row in rows))
+        self.assertTrue(any('ambiguous_title' in str(row) for row in rows))
+        self.assertNotIn('https://', report.read_text(encoding='utf-8-sig'))
+        for console, count in (('gba', 3), ('nes', 7), ('psp', 2)):
+            for game in self.app.games_by_system[console]:
+                self.assertEqual(game.path.read_bytes(), b'ROM unchanged')
+        for console in ('nes', 'psp'):
+            self.assertFalse((self.root/'roms'/console/'images'/'novacore').exists())

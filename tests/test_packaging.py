@@ -11,3 +11,6 @@ def test_packaged_self_test_exercises_launchbox_catalogue_and_source_chain(tmp_p
     assert result['success'] is True
     assert 'LaunchBox catalogue parser' in result['tests']
     assert 'automatic source fallback' in result['tests']
+    assert 'coverage matching' in result['tests']
+    assert 'provider adapters' in result['tests']
+    assert 'result report' in result['tests']

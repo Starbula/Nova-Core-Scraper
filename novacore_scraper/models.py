@@ -31,3 +31,6 @@ class Artwork:
     url: str
     source: str
     region: str = ''
+    match_note: str = ''
+    matched_title: str = ''
+    provider_game_id: str = ''

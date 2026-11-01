@@ -14,6 +14,7 @@ import requests
 from PIL import Image
 
 from novacore_scraper.models import Artwork, Game, System
+from novacore_scraper.matching import MatchPolicy
 
 
 @pytest.fixture
@@ -98,7 +99,7 @@ def test_libretro_will_not_cross_regions_or_guess_a_sequel(provider_module, tran
     routes, _ = transport
     routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
         '<a href="Sonic the Hedgehog (USA).png">US</a><a href="Sonic the Hedgehog 2 (Europe).png">2</a>', {})
-    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0, match_policy=MatchPolicy(False, False))
     assert p.find(game(tmp_path), lambda: None) is None
     assert p.find(game(tmp_path, 'Sonic'), lambda: None) is None
 
@@ -116,7 +117,7 @@ def test_libretro_never_matches_a_different_disc_or_revision(provider_module, tr
     routes, _ = transport
     routes['/Sony%20-%20PlayStation/Named_Boxarts/'] = (200,
         '<a href="Final Fantasy VII (Europe) (Disc 2).png">2</a>', {})
-    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0, match_policy=MatchPolicy(False, False))
     assert p.find(game(tmp_path, 'Final Fantasy VII (Europe) (Disc 1)', 'psx'), lambda: None) is None
 
 
@@ -246,7 +247,7 @@ def test_screenscraper_explicit_id_override_and_region_do_not_guess(provider_mod
     routes['/api2/jeuRecherche.php'] = (200, {'response': {'jeux': [{'id': '11', 'systeme': {'id': '99'},
         'noms': [{'text': 'Sonic the Hedgehog', 'region': 'us'}],
         'medias': [{'type': 'box-2D', 'region': 'us', 'url': 'https://api.screenscraper.fr/a.png'}]}]}}, {})
-    p = ss_provider(provider_module, tmp_path)
+    p = ss_provider(provider_module, tmp_path, match_policy=MatchPolicy(False, False))
     assert p.find(game(tmp_path, system='custom', ssid='99'), lambda: None) is None
 
 
@@ -745,7 +746,7 @@ def test_goodtools_metadata_never_erases_content_qualifiers(provider_module, tra
     routes, _ = transport
     routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
         '<a href="Sonic the Hedgehog (USA).png">US</a>', {})
-    p = provider_module.LibretroProvider(tmp_path / 'cache', region='eu', interval=0)
+    p = provider_module.LibretroProvider(tmp_path / 'cache', region='eu', interval=0, match_policy=MatchPolicy(False, False))
     assert p.find(game(tmp_path, f'Sonic the Hedgehog (U) ({qualifier}) [!]'), lambda: None) is None
 
 
@@ -753,7 +754,7 @@ def test_libretro_goodtools_combined_regions_do_not_allow_other_regions(provider
     routes, _ = transport
     routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
         '<a href="Sonic the Hedgehog (Japan).png">JP</a>', {})
-    p = provider_module.LibretroProvider(tmp_path / 'cache', region='jp', interval=0)
+    p = provider_module.LibretroProvider(tmp_path / 'cache', region='jp', interval=0, match_policy=MatchPolicy(False, False))
     assert p.find(game(tmp_path, 'Sonic the Hedgehog (UE) [!]'), lambda: None) is None
 
 
@@ -838,3 +839,196 @@ def test_prepared_dispatch_preserves_session_and_environment_settings(provider_m
     assert kwargs == {'timeout': (5, 20), 'allow_redirects': False, 'stream': True,
         'verify': '/fixture-ca.pem', 'cert': ('/fixture-cert.pem', '/fixture-key.pem'),
         'proxies': {'https': 'http://proxy.invalid:8080'}}
+
+
+def test_libretro_normalized_title_and_annotated_revision_region_fallback(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/Nintendo%20-%20Game%20Boy/Named_Boxarts/'] = (200,
+        '<a href="PokemonRedVersion (USA).png">US</a>', {})
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    result = p.find(game(tmp_path, 'Pokémon - Red Version (Europe) (Rev 1)', 'gb'), lambda: None)
+    assert result and result.region == 'us'
+    assert 'base' in result.match_note.lower() and 'region' in result.match_note.lower()
+    assert result.matched_title == 'PokemonRedVersion (USA)'
+
+
+def test_libretro_trailing_article_and_unknown_parenthetical_part(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
+        '<a href="The Adventure (USA).png">US</a><a href="Game (Adventure) (Europe).png">part</a>', {})
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    assert p.find(game(tmp_path, 'Adventure, The (Europe)'), lambda: None)
+    assert p.find(game(tmp_path, 'Game (Europe)'), lambda: None) is None
+
+
+def test_screenscraper_normalized_identity_and_fallback_annotation(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/api2/ssuserInfos.php'] = (200, ss_user(), {})
+    routes['/api2/systemesListe.php'] = (200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {})
+    routes['/api2/jeuRecherche.php'] = (200, {'response': {'jeux': [{'id': '11', 'systeme': {'id': '1'},
+        'noms': [{'text': 'PokémonRedVersion', 'region': 'us'}],
+        'medias': [{'type': 'box-2D', 'region': 'us', 'url': 'https://api.screenscraper.fr/box.png'}]}]}}, {})
+    result = ss_provider(provider_module, tmp_path).find(game(tmp_path, 'Pokemon - Red Version (Europe) (Rev 1)'), lambda: None)
+    assert result and result.region == 'us' and result.provider_game_id == '11'
+    assert 'base' in result.match_note.lower() and 'region' in result.match_note.lower()
+
+
+def test_screenscraper_resolves_unique_identity_before_regional_media(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/api2/ssuserInfos.php'] = (200, ss_user(), {})
+    routes['/api2/systemesListe.php'] = (200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {})
+    routes['/api2/jeuRecherche.php'] = (200, {'response': {'jeux': [
+        {'id': '11', 'systeme': {'id': '1'}, 'noms': [{'text': 'Game'}],
+         'medias': [{'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr/a.png'}]},
+        {'id': '22', 'systeme': {'id': '1'}, 'noms': [{'text': 'Game!'}],
+         'medias': [{'type': 'box-2D', 'region': 'us', 'url': 'https://api.screenscraper.fr/b.png'}]},
+        {'id': '33', 'systeme': {'id': '2'}, 'noms': [{'text': 'Game'}], 'medias': []},
+    ]}}, {})
+    assert ss_provider(provider_module, tmp_path).find(game(tmp_path, 'Game (Europe)'), lambda: None) is None
+
+
+def test_screenscraper_plain_alias_cannot_hide_qualified_variant(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/api2/ssuserInfos.php'] = (200, ss_user(), {})
+    routes['/api2/systemesListe.php'] = (200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {})
+    routes['/api2/jeuRecherche.php'] = (200, {'response': {'jeux': [{'id': '11', 'systeme': {'id': '1'},
+        'noms': [{'text': 'Game (Hack)'}, {'text': 'Game'}],
+        'medias': [{'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr/box.png'}]}]}}, {})
+    p = ss_provider(provider_module, tmp_path)
+    assert p.find(game(tmp_path, 'Game (Europe)'), lambda: None) is None
+    assert p.find(game(tmp_path, 'Game (Europe) (Hack)'), lambda: None)
+
+
+@pytest.mark.parametrize('title,qualifier', [('Prototype', 'Prototype'), ('Hackers', 'Hack'), ('Game', 'Bootleg'), ('Game', 'Adventure')])
+def test_screenscraper_title_words_never_authorize_variant_qualifiers(provider_module, transport, tmp_path, title, qualifier):
+    routes, _ = transport
+    routes['/api2/ssuserInfos.php'] = 200, ss_user(), {}
+    routes['/api2/systemesListe.php'] = 200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {}
+    routes['/api2/jeuRecherche.php'] = 200, {'response': {'jeux': [{'id': '11', 'systeme': {'id': '1'},
+        'noms': [{'text': title + ' (' + qualifier + ')'}, {'text': title}],
+        'medias': [{'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr/box.png'}]}]}}, {}
+    p = ss_provider(provider_module, tmp_path)
+    assert p.find(game(tmp_path, title + ' (Europe)'), lambda: None) is None
+    assert p.find(game(tmp_path, title + ' (Europe) (' + qualifier + ')'), lambda: None)
+
+
+def test_screenscraper_qualifier_guard_aggregates_same_id_aliases(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/api2/ssuserInfos.php'] = 200, ss_user(), {}
+    routes['/api2/systemesListe.php'] = 200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {}
+    routes['/api2/jeuRecherche.php'] = 200, {'response': {'jeux': [
+        {'id': '11', 'systeme': {'id': '1'}, 'noms': [{'text': 'Game (Bootleg)'}], 'medias': []},
+        {'id': '11', 'systeme': {'id': '1'}, 'noms': [{'text': 'Game'}],
+         'medias': [{'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr/box.png'}]},
+    ]}}, {}
+    assert ss_provider(provider_module, tmp_path).find(game(tmp_path, 'Game (Europe)'), lambda: None) is None
+
+
+def test_libretro_candidates_are_lazy_ranked_and_respect_policy(provider_module, transport, tmp_path):
+    routes, calls = transport
+    routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = 200, (
+        '<a href="Game (Europe).png">EU</a><a href="Game (USA).png">US</a>'
+        '<a href="Game (Europe) (Rev 1).png">revision</a><a href="Game (Europe) (Hack).png">hack</a>'
+        '<a href="Game 2 (Europe).png">sequel</a>'), {}
+    item = game(tmp_path, 'Game (Europe)')
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    candidates = p.candidates(item, lambda: None)
+    assert calls == []
+    results = list(candidates)
+    assert [result.matched_title for result in results] == ['Game (Europe)', 'Game (Europe) (Rev 1)', 'Game (USA)']
+    assert p.find(item, lambda: None) == results[0]
+    strict = provider_module.LibretroProvider(tmp_path / 'cache', interval=0, match_policy=MatchPolicy(False, False))
+    assert [result.matched_title for result in strict.candidates(item, lambda: None)] == ['Game (Europe)']
+
+
+@pytest.mark.parametrize('source', ['Libretro', 'ScreenScraper'])
+def test_engine_tries_same_game_cover_after_first_region_404(provider_module, transport, tmp_path, source):
+    from urllib.parse import quote
+    from novacore_scraper.engine import ScrapeEngine
+    routes, calls = transport
+    item = game(tmp_path)
+    if source == 'Libretro':
+        directory = '/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'
+        routes[directory] = 200, ('<a href="Sonic the Hedgehog (Europe).png">EU</a>'
+            '<a href="Sonic the Hedgehog (USA).png">US</a><a href="Sonic the Hedgehog 2 (Europe).png">wrong</a>'), {}
+        broken = directory + quote('Sonic the Hedgehog (Europe).png', safe='')
+        healthy = directory + quote('Sonic the Hedgehog (USA).png', safe='')
+        p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    else:
+        routes['/api2/ssuserInfos.php'] = 200, ss_user(), {}
+        routes['/api2/systemesListe.php'] = 200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {}
+        broken, healthy = '/eu.png', '/us.png'
+        routes['/api2/jeuRecherche.php'] = 200, {'response': {'jeux': [
+            {'id': '11', 'systeme': {'id': '1'}, 'noms': [{'text': 'Sonic the Hedgehog'}], 'medias': [
+                {'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr' + broken},
+                {'type': 'box-2D', 'region': 'us', 'url': 'https://api.screenscraper.fr' + healthy}]},
+            {'id': '22', 'systeme': {'id': '1'}, 'noms': [{'text': 'Sonic the Hedgehog 2'}], 'medias': [
+                {'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr/wrong.png'}]},
+        ]}}, {}
+        p = ss_provider(provider_module, tmp_path)
+    p._rate = lambda checkpoint: checkpoint()
+    routes[broken] = 404, b'missing cover', {}
+    routes[healthy] = 200, png_bytes(), {}
+    engine = ScrapeEngine(tmp_path, p, process_running=lambda: True, retry_passes=0, keep_awake=False)
+    engine.start([item])
+    assert engine.wait(5)
+    assert (engine.snapshot().completed, engine.snapshot().missing, engine.snapshot().failed) == (1, 0, 0)
+    job = engine.jobs_page()[0][0]
+    assert job.region == 'us' and 'region' in job.match_note.lower() and Path(job.artwork).is_file()
+    downloaded = [urlsplit(url).path for url, _ in calls if urlsplit(url).path in {broken, healthy, '/wrong.png'}]
+    assert downloaded == [broken, healthy]
+
+
+def test_screenscraper_candidates_are_lazy_ranked_and_share_verified_id(provider_module, transport, tmp_path):
+    routes, calls = transport
+    routes['/api2/ssuserInfos.php'] = 200, ss_user(), {}
+    routes['/api2/systemesListe.php'] = 200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {}
+    routes['/api2/jeuRecherche.php'] = 200, {'response': {'jeux': [{'id': '11', 'systeme': {'id': '1'},
+        'noms': [{'text': 'Game'}], 'medias': [
+            {'type': 'box-2D', 'region': region, 'url': 'https://api.screenscraper.fr/' + name}
+            for name, region in [('us.png', 'us'), ('eu-b.png', 'eu'), ('eu-a.png', 'eu'), ('eu-a.png', 'eu')]]}]}}, {}
+    p = ss_provider(provider_module, tmp_path)
+    p._rate = lambda checkpoint: checkpoint()
+    item = game(tmp_path, 'Game (Europe)')
+    candidates = p.candidates(item, lambda: None)
+    assert calls == []
+    results = list(candidates)
+    assert [result.url.rsplit('/', 1)[1] for result in results] == ['eu-a.png', 'eu-b.png', 'us.png']
+    assert {result.provider_game_id for result in results} == {'11'}
+    assert p.find(item, lambda: None) == results[0]
+    p.match_policy = MatchPolicy(False, False)
+    assert [result.region for result in p.candidates(item, lambda: None)] == ['eu', 'eu']
+    assert all('/api2/' in url for url, _ in calls)
+
+
+def test_screenscraper_full_parenthetical_title_matches_equivalent_typography(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/api2/ssuserInfos.php'] = 200, ss_user(), {}
+    routes['/api2/systemesListe.php'] = 200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {}
+    routes['/api2/jeuRecherche.php'] = 200, {'response': {'jeux': [{'id': '11', 'systeme': {'id': '1'},
+        'noms': [{'text': 'Adventure (Episode II)'}],
+        'medias': [{'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr/episode-ii.png'}]}]}}, {}
+    p = ss_provider(provider_module, tmp_path)
+    p._rate = lambda checkpoint: checkpoint()
+    plain = p.find(game(tmp_path, 'Adventure Episode II (Europe)'), lambda: None)
+    parenthetical = p.find(game(tmp_path, 'Adventure (Episode II) (Europe)'), lambda: None)
+    assert plain is not None and plain == parenthetical
+    assert plain.provider_game_id == '11' and plain.matched_title == 'Adventure (Episode II)'
+    assert p.find(game(tmp_path, 'Adventure (Europe)'), lambda: None) is None
+
+
+@pytest.mark.parametrize('names,requested', [
+    (['Game (Hack)', 'Game (Prototype)', 'GameHackPrototype'], 'Game (Hack) (Prototype)'),
+    (['Game (Hack)', 'Game (Prototype)', 'Game'], 'Game (Hack)'),
+    (['Adventure (Episode II)', '(Adventure) Episode II'], 'Adventure Episode II'),
+])
+def test_screenscraper_disagreeing_qualified_aliases_never_authorize_variants(provider_module, transport, tmp_path, names, requested):
+    routes, _ = transport
+    routes['/api2/ssuserInfos.php'] = 200, ss_user(), {}
+    routes['/api2/systemesListe.php'] = 200, {'response': {'systemes': [{'id': '1', 'noms': {'nom_recalbox': 'megadrive'}}]}}, {}
+    routes['/api2/jeuRecherche.php'] = 200, {'response': {'jeux': [{'id': '11', 'systeme': {'id': '1'},
+        'noms': [{'text': name} for name in names],
+        'medias': [{'type': 'box-2D', 'region': 'eu', 'url': 'https://api.screenscraper.fr/variant.png'}]}]}}, {}
+    p = ss_provider(provider_module, tmp_path)
+    p._rate = lambda checkpoint: checkpoint()
+    assert p.find(game(tmp_path, requested + ' (Europe)'), lambda: None) is None

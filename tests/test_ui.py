@@ -166,7 +166,8 @@ class TkTests(unittest.TestCase):
         self.root._novacore_smoke_test = True
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        with patch.object(ui, 'load_settings', return_value=Settings()):
+        with patch.object(ui, 'load_settings', return_value=Settings()), \
+             patch.dict(ui.os.environ, {env:'' for _key, _label, env in ui._CREDENTIALS}):
             self.app = ui.App(self.root)
         self.addCleanup(self.destroy_root)
 
@@ -437,7 +438,7 @@ class TkTests(unittest.TestCase):
 
     def test_settings_offer_sources_and_fast_preset_with_new_limits(self):
         provider_widget = self.app._settings_controls[0][0]
-        self.assertEqual(tuple(provider_widget.cget('values')), ('automatic','libretro','launchbox','screenscraper'))
+        self.assertEqual(tuple(provider_widget.cget('values')), ('automatic','libretro','launchbox','gametdb','thegamesdb','igdb','mobygames','screenscraper'))
         self.assertEqual(self.app.provider_setting_var.get(), 'automatic')
         self.assertIn('Libretro', self.app.provider_var.get())
         self.assertIn('LaunchBox', self.app.provider_var.get())
@@ -459,13 +460,289 @@ class TkTests(unittest.TestCase):
             provider = self.app._make_provider()
         self.addCleanup(provider.close)
         self.assertIsInstance(provider, ui.FallbackProvider)
-        self.assertEqual([type(source) for source in provider.providers], [ui.LibretroProvider,ui.LaunchBoxProvider])
+        self.assertEqual([type(source) for source in provider.providers], [ui.LibretroProvider,ui.LaunchBoxProvider,ui.GameTDBProvider])
         self.assertEqual(provider.workers,8)
         self.app.settings = replace(self.app.settings,provider='launchbox')
         with patch.object(ui, 'data_directory', return_value=Path(self.temp.name)):
             standalone = self.app._make_provider()
         self.addCleanup(standalone.close)
         self.assertIsInstance(standalone,ui.LaunchBoxProvider)
+
+    def test_optional_sources_remain_unconfigured_until_their_credentials_are_complete(self):
+        self.install_console_fixture()
+        self.app.select_console('gba')
+        for provider in ('thegamesdb', 'igdb', 'mobygames'):
+            self.app.provider_setting_var.set(provider)
+            self.assertTrue(self.app.start_button.instate(['disabled']))
+            self.assertIn('unconfigured', self.app.provider_var.get().lower())
+        self.app.igdb_id_var.set('my-client')
+        self.assertTrue(self.app.start_button.instate(['disabled']))
+        self.app.moby_key_var.set('my-moby-key')
+        self.assertTrue(self.app.start_button.instate(['!disabled']))
+        self.app.use_automatic_button.invoke()
+        self.assertTrue(self.app.start_button.instate(['!disabled']))
+        self.assertIn('MobyGames', self.app.sources_status_var.get())
+        self.assertIn('unconfigured', self.app.sources_status_var.get().lower())
+
+    def test_automatic_sources_use_only_configured_accounts_and_matching_policy(self):
+        self.app.credentials.update(username='account', password='secret', tgdb_api_key='tgdb',
+                                    igdb_client_id='id', igdb_client_secret='secret', mobygames_api_key='moby')
+        self.app.settings = replace(self.app.settings, allow_other_regions=False, allow_base_cover=False)
+        with patch.object(ui.auth, 'screen_scraper_app_credentials', return_value=('app-id', 'app-secret')), \
+             patch.object(ui, 'data_directory', return_value=Path(self.temp.name)):
+            provider = self.app._make_provider()
+        self.addCleanup(provider.close)
+        self.assertEqual([type(source) for source in provider.providers],
+                         [ui.LibretroProvider, ui.LaunchBoxProvider, ui.GameTDBProvider,
+                          ui.ScreenScraperProvider, ui.TheGamesDBProvider, ui.IGDBProvider, ui.MobyGamesProvider])
+        for source in provider.providers:
+            if isinstance(source, ui.ScreenScraperProvider):
+                continue
+            self.assertFalse(source.match_policy.allow_other_regions)
+            self.assertFalse(source.match_policy.allow_base_cover)
+
+    def test_settings_source_readiness_wraps_inside_smallest_window(self):
+        self.root.deiconify()
+        self.root.geometry('920x660')
+        self.app.show_settings()
+        self.root.update()
+        pending = list(self.app.settings_canvas.winfo_children())
+        labels = []
+        while pending:
+            widget = pending.pop()
+            pending.extend(widget.winfo_children())
+            if isinstance(widget, ui.ttk.Label) and str(widget.cget('textvariable')) == str(self.app.sources_status_var):
+                labels.append(widget)
+        self.assertEqual(len(labels), 1)
+        self.assertLessEqual(int(labels[0].cget('wraplength')), self.app.settings_canvas.winfo_width()-16)
+
+    def test_matching_and_unattended_options_are_saved_as_nonsecret_settings(self):
+        self.assertTrue(self.app.allow_other_regions_var.get())
+        self.assertTrue(self.app.allow_base_cover_var.get())
+        self.assertTrue(self.app.retry_failed_var.get())
+        self.assertTrue(self.app.keep_awake_var.get())
+        self.app.allow_other_regions_var.set(False)
+        self.app.allow_base_cover_var.set(False)
+        self.app.retry_failed_var.set(False)
+        self.app.keep_awake_var.set(False)
+        self.assertTrue(self.app._apply_settings())
+        for key in ('allow_other_regions', 'allow_base_cover', 'retry_failed', 'keep_awake'):
+            self.assertFalse(getattr(self.app.settings, key))
+        self.assertIsInstance(self.app.settings_canvas, tk.Canvas)
+
+    def test_start_passes_retry_and_keep_awake_choices_to_engine(self):
+        self.install_console_fixture()
+        self.app.select_console('gba')
+        self.app.retry_failed_var.set(False)
+        self.app.keep_awake_var.set(False)
+        captured = {}
+        class Engine:
+            active = False
+            def __init__(self, root, provider, **options):
+                captured.update(options)
+            def start(self, games):
+                captured['games'] = list(games)
+            def snapshot(self):
+                return Progress()
+        with patch.object(ui, 'ScrapeEngine', Engine), patch.object(self.app, '_make_provider', return_value=object()), \
+             patch.object(self.app, '_request_page'):
+            self.app.start()
+        self.assertEqual(captured['retry_passes'], 0)
+        self.assertFalse(captured['keep_awake'])
+        self.assertEqual([game.system.name for game in captured['games']], ['gba'])
+
+    def test_saved_credentials_failure_keeps_session_values_and_never_enters_settings(self):
+        self.app._smoke_test = False
+        self.app._remember_available = True
+        self.app.remember_credentials_var.set(True)
+        self.app.tgdb_key_var.set('SESSION-TGDB-SECRET')
+        with patch.object(ui, 'save_settings') as save, \
+             patch.object(ui, 'can_remember_credentials', return_value=True), \
+             patch.object(ui, 'save_credentials', side_effect=OSError('fixture secret must not be shown')):
+            self.assertTrue(self.app._apply_settings())
+            self.pump_until(lambda: 'session' in self.app.settings_status_var.get().lower() and
+                            'could not' in self.app.settings_status_var.get().lower())
+        self.assertEqual(self.app.credentials['tgdb_api_key'], 'SESSION-TGDB-SECRET')
+        self.assertNotIn('SESSION-TGDB-SECRET', repr(asdict(save.call_args.args[0])))
+        self.assertNotIn('fixture secret', self.app.settings_status_var.get())
+
+    def test_saved_credentials_load_in_background_without_replacing_typing_or_environment(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        owner = threading.get_ident()
+        threads = []
+        def load():
+            threads.append(threading.get_ident())
+            entered.set()
+            release.wait(3)
+            return dict(username='saved-user', tgdb_api_key='saved-tgdb', igdb_client_id='saved-id')
+        self.app._run_background('credentials-load', load, independent=True)
+        self.pump_until(entered.is_set)
+        self.app.account_username_var.set('typed-user')
+        with patch.dict(ui.os.environ, {'NOVACORE_TGDB_API_KEY':'environment-tgdb'}):
+            release.set()
+            self.pump_until(lambda:not self.app._background_threads)
+        self.assertNotEqual(threads, [owner])
+        self.assertEqual(self.app.account_username_var.get(), 'typed-user')
+        self.assertEqual(self.app.tgdb_key_var.get(), 'environment-tgdb')
+        self.assertEqual(self.app.igdb_id_var.get(), 'saved-id')
+        self.assertEqual(self.app.credentials['igdb_client_id'], 'saved-id')
+
+    def test_unchecking_remember_clears_saved_values_off_tk_and_keeps_session_credentials(self):
+        self.app._smoke_test = False
+        self.app._remember_available = True
+        self.app.remember_credentials_var.set(False)
+        self.app.tgdb_key_var.set('my-session-key')
+        owner, threads = threading.get_ident(), []
+        with patch.object(ui, 'save_settings'), patch.object(ui, 'clear_credentials', side_effect=lambda:threads.append(threading.get_ident())):
+            self.assertTrue(self.app._apply_settings())
+            self.pump_until(lambda:not self.app._background_threads)
+        self.assertNotEqual(threads, [owner])
+        self.assertEqual(self.app.credentials['tgdb_api_key'], 'my-session-key')
+        self.assertFalse(self.app.settings.remember_credentials)
+        self.assertIn('cleared', self.app.settings_status_var.get())
+
+    def test_start_before_saved_credentials_load_finishes_preserves_unedited_saved_keys(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        saved = dict(username='saved-user', tgdb_api_key='saved-tgdb', igdb_client_id='saved-id')
+        def load():
+            entered.set()
+            release.wait(3)
+            return dict(saved)
+        self.app._smoke_test = False
+        self.app._remember_available = True
+        self.app.remember_credentials_var.set(True)
+        self.app._run_background('credentials-load', load, independent=True)
+        self.pump_until(entered.is_set)
+        self.app.account_username_var.set('typed-user')
+        captured = []
+        with patch.object(ui, 'save_settings'), patch.object(ui, 'configured_credentials', return_value=saved), \
+             patch.object(ui, 'save_credentials', side_effect=lambda values:captured.append(dict(values))):
+            self.assertTrue(self.app._apply_settings())
+            self.pump_until(lambda:bool(captured))
+            release.set()
+            self.pump_until(lambda:not self.app._background_threads)
+        self.assertEqual(captured[0]['username'], 'typed-user')
+        self.assertEqual(captured[0]['tgdb_api_key'], 'saved-tgdb')
+        self.assertEqual(captured[0]['igdb_client_id'], 'saved-id')
+
+    def test_start_waits_for_saved_credentials_then_includes_every_configured_source(self):
+        self.install_console_fixture()
+        self.app.select_console('gba')
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        saved = dict(username='saved-user', password='saved-password', tgdb_api_key='saved-tgdb',
+                     igdb_client_id='saved-id', igdb_client_secret='saved-secret', mobygames_api_key='saved-moby')
+        def load():
+            entered.set()
+            release.wait(3)
+            return dict(saved)
+        self.app._run_background('credentials-load', load, independent=True)
+        self.pump_until(entered.is_set)
+        captured = []
+        class Engine:
+            active = False
+            def __init__(self, root, provider, **options):
+                self.provider = provider
+                captured.append(self)
+            def start(self, games):
+                self.games = list(games)
+            def snapshot(self):
+                return Progress()
+        with patch.object(ui.auth, 'screen_scraper_app_credentials', return_value=('app-id', 'app-secret')), \
+             patch.object(ui, 'data_directory', return_value=Path(self.temp.name)), \
+             patch.object(ui, 'ScrapeEngine', Engine), patch.object(self.app, '_request_page'):
+            self.assertTrue(self.app.start_button.instate(['disabled']))
+            self.assertIn('Loading saved provider credentials', self.app.provider_var.get())
+            self.app.start()
+            self.assertEqual(captured, [], 'Programmatic Start must also wait for saved credentials.')
+            release.set()
+            self.pump_until(lambda:'credentials-load' not in self.app._background_threads)
+            self.assertTrue(self.app.start_button.instate(['!disabled']))
+            self.app.start()
+        self.assertEqual(len(captured), 1)
+        provider = captured[0].provider
+        self.addCleanup(provider.close)
+        self.assertEqual([type(source) for source in provider.providers],
+                         [ui.LibretroProvider, ui.LaunchBoxProvider, ui.GameTDBProvider,
+                          ui.ScreenScraperProvider, ui.TheGamesDBProvider, ui.IGDBProvider, ui.MobyGamesProvider])
+        self.assertEqual([game.system.name for game in captured[0].games], ['gba'])
+
+    def test_close_finishes_latest_queued_credential_save(self):
+        self.app._smoke_test = False
+        self.app._remember_available = True
+        self.app.remember_credentials_var.set(True)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        saved = []
+        def store(values):
+            saved.append(values['tgdb_api_key'])
+            if len(saved) == 1:
+                entered.set()
+                release.wait(3)
+        with patch.object(ui, 'save_settings'), patch.object(ui, 'save_credentials', side_effect=store):
+            self.app.tgdb_key_var.set('first-key')
+            self.assertTrue(self.app._apply_settings())
+            self.pump_until(entered.is_set)
+            self.app.tgdb_key_var.set('latest-key')
+            self.assertTrue(self.app._apply_settings())
+            self.app.close()
+            release.set()
+            deadline = time.monotonic()+3
+            while time.monotonic() < deadline:
+                try:
+                    self.root.update()
+                    if not self.root.winfo_exists():
+                        break
+                except tk.TclError:
+                    break
+                time.sleep(.005)
+        self.assertEqual(saved, ['first-key', 'latest-key'])
+
+    def test_export_dialog_guides_users_to_csv_reports(self):
+        self.app.retrobat_root = Path(self.temp.name)
+        with patch.object(ui.filedialog, 'asksaveasfilename', return_value='') as dialog:
+            self.app.export_results()
+        self.assertEqual(dialog.call_args.kwargs['defaultextension'], '.csv')
+        self.assertEqual(dialog.call_args.kwargs['filetypes'], (('CSV report', '*.csv'),))
+
+    def test_export_runs_off_tk_while_engine_is_active(self):
+        from types import SimpleNamespace
+        owner = threading.get_ident()
+        calls = []
+        self.app.retrobat_root = Path(self.temp.name)
+        self.app.engine = SimpleNamespace(active=True, snapshot=lambda: Progress(state='Scraping'))
+        destination = Path(self.temp.name)/'results.csv'
+        def export(root, path):
+            calls.append((threading.get_ident(), root, path))
+            path.write_text('title,status\nGame,missing\n')
+            return 1
+        with patch.object(ui.filedialog, 'asksaveasfilename', return_value=str(destination)), \
+             patch.object(ui.State, 'export_report', side_effect=export):
+            self.app._refresh_buttons()
+            self.assertTrue(self.app.export_results_button.instate(['!disabled']))
+            self.app.export_results_button.invoke()
+            self.pump_until(lambda:bool(calls) and destination.exists())
+            self.pump_until(lambda:not self.app._background_threads)
+        self.assertNotEqual(calls[0][0], owner)
+        self.assertEqual(calls[0][1:], (self.app.retrobat_root, destination))
+        self.assertEqual(destination.read_text(), 'title,status\nGame,missing\n')
+        self.assertTrue(self.app.engine.active)
+
+    def test_job_details_show_source_reason_region_and_match_note(self):
+        from types import SimpleNamespace
+        from novacore_scraper.engine import JobSnapshot
+        row = JobSnapshot('gba/game', 'Game', 'GBA', 'missing', detail='No front cover',
+                          reason='missing_front_cover', source='GameTDB', region='us',
+                          match_note='Base-game cover for Disc 2', attempts=3)
+        self.app.engine = SimpleNamespace(active=False, jobs_revision=1, snapshot=lambda:Progress(),
+                                          jobs_page=lambda **options:([row], 1))
+        self.app._request_page('jobs')
+        self.pump_until(lambda:self.app.jobs_tree.exists('gba/game'))
+        detail = self.app.jobs_tree.set('gba/game', 'detail')
+        for value in ('No front cover', 'GameTDB', 'us', 'Base-game cover for Disc 2', '3'):
+            self.assertIn(value, detail)
 
     def test_poll_updates_only_reported_console_covers_without_rescanning_games(self):
         from types import SimpleNamespace
@@ -514,7 +791,7 @@ class TkTests(unittest.TestCase):
         self.app.engine = SimpleNamespace(active=False,snapshot=lambda:Progress(),artwork_counts=lambda:{'gba':1})
         class NewEngine:
             active = False
-            def __init__(self,*args):
+            def __init__(self,*args,**kwargs):
                 pass
             def start(self,games):
                 pass
@@ -725,6 +1002,28 @@ class TkTests(unittest.TestCase):
         self.app.cancel_all_button.invoke()
         self.assertEqual(cancelled, [('gba/one.gba',)])
         self.assertEqual(all_cancelled, [True])
+
+    def test_active_filter_keeps_retry_wait_jobs_visible_and_cancellable(self):
+        from types import SimpleNamespace
+        from novacore_scraper.engine import JobSnapshot
+        self.assertIn('retry_wait', ui.JOB_FILTERS)
+        waiting = JobSnapshot('gba/waiting', 'Waiting game', 'GBA', 'retry_wait', detail='Temporary source failure')
+        cancelled = []
+        def jobs(**options):
+            rows = [waiting] if not options['statuses'] or waiting.status in options['statuses'] else []
+            return rows, len(rows)
+        self.app.engine = SimpleNamespace(active=True, jobs_revision=1, snapshot=lambda:Progress(state='Scraping'),
+            jobs_page=jobs, cancel_jobs=lambda keys:cancelled.append(tuple(keys)))
+        page = self.app._pages['jobs']
+        page['status'].set('Active')
+        self.pump_until(lambda:page['applied'] is not None)
+        self.assertTrue(self.app.jobs_tree.exists(waiting.key))
+        self.assertEqual(self.app.jobs_tree.set(waiting.key, 'status'), 'Retry wait')
+        self.app.jobs_tree.selection_set(waiting.key)
+        self.app._refresh_buttons()
+        self.assertTrue(self.app.cancel_selected_button.instate(['!disabled']))
+        self.app.cancel_selected_button.invoke()
+        self.assertEqual(cancelled, [(waiting.key,)])
 
     def test_close_waits_for_background_work_without_blocking_tk(self):
         release = threading.Event()
