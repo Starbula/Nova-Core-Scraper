@@ -118,6 +118,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(rows[0]['title'], 'Game')
         with State(self.root) as state:
             self.assertEqual(state.pending()[0]['key'], 'roms/nes/Game.nes')
+            self.assertEqual(state.pending()[0]['source_trace'], '')
             state.record(self.game, 'skipped')
             self.assertEqual(state.pending()[0]['key'], 'roms/nes/Game.nes')
         rows, total = State.downloaded_page(self.root)

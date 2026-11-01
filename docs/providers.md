@@ -104,6 +104,10 @@ Windows keep-awake requests are made and reset on the coordinator thread through
 
 ## Verification limits
 
+Source diagnostics retain each game's search trace and show per-source game, match, saved-cover and actual outgoing-request counters. Explicit TheGamesDB/IGDB checks bypass cached platform data to verify authenticated API access; ordinary cached preparation alone does not verify an account. The last server allowance is distinct from the conservative local request budget. Local budget denial cannot discard an already paid successful response or block its public cover download; genuine authentication failures still terminate rejected access. Network errors do not justify silently replenishing an uncertain request budget.
+
+Verified RetroBat system aliases now route MSU console variants, WonderSwan folder names, Amiga 4000, BBC Micro and the supported arcade subdivisions to equivalent platform catalogues. This fixes platform routing only; it does not fabricate title matches for short arcade ROM IDs or guarantee that a catalogue supplies a front cover.
+
 Automated tests use temporary libraries, deterministic encoded images/HTTP fixtures, threads and actual SQLite/filesystem operations. They cover source schemas, auth isolation, quotas, cache guards, ID/qualifier ambiguity, alternate-image recovery, retries/cancellation, reports, DPAPI races, native path aliases and metadata integrity.
 
 Public live checks on 2026-11-01 parsed the official LaunchBox export and downloaded regional covers. A current-index check matched `Super Mario Land 2 - 6 Golden Coins (USA) (Rev 1)` to its verified base game's US cover with a revision note, while `Tetris 999` and an unrelated hack remained unmatched. `Pokemon - Red Version` was honestly ambiguous across multiple catalogue IDs, rather than assigned an arbitrary cover. A GameTDB Wii disc-header engine check downloaded and validated a cover while retaining fixture ROM bytes and deferring metadata.

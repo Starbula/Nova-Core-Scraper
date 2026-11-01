@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 import threading
 import time
 from pathlib import Path
@@ -32,6 +33,8 @@ def error_diagnostic(error):
     if isinstance(error, AuthenticationError):
         return 'authentication', 'The source credentials are missing or were rejected.', False
     if isinstance(error, QuotaError):
+        if getattr(error, 'reason', '') == 'allowance_unconfirmed':
+            return 'allowance_unconfirmed', safe_detail(error), False
         return 'quota_exhausted', 'The source allowance is exhausted; resume after it resets.', False
     if type(error).__name__ == 'ArtworkUnavailable':
         return 'no_artwork', 'The matched artwork is no longer available (HTTP 404).', False
@@ -51,8 +54,21 @@ def error_diagnostic(error):
     return 'local_error', 'Could not save or process artwork. Check file permissions and the scraper log.', False
 
 
+@dataclass(frozen=True)
+class SourceSnapshot:
+    name: str
+    state: str = 'waiting'
+    detail: str = 'Awaiting the first lookup.'
+    lookups: int = 0
+    matches: int = 0
+    downloads: int = 0
+    requests: int = 0
+    api_requests: int = 0
+    remaining: int | None = None
+
+
 class _SourceFailure(ProviderError):
-    def __init__(self, failures):
+    def __init__(self, failures, trace=''):
         names = ', '.join(dict.fromkeys(name for name, _ in failures)) or 'No configured sources'
         self.retryable = any(info[2] for _, info in failures)
         reasons = {info[0] for _, info in failures}
@@ -62,7 +78,8 @@ class _SourceFailure(ProviderError):
         summary = '; '.join(name+': '+info[0].replace('_', ' ') for name, info in failures)
         super().__init__('Artwork source unavailable: '+(summary or names)+'. '+
                          ('Temporary failures will be retried.' if self.retryable else
-                          'Review source settings or the unresolved results.'))
+                          'Review source settings or the unresolved results.')+
+                         (' Sources tried: '+trace if trace else ''))
 
 
 class FallbackProvider:
@@ -87,6 +104,61 @@ class FallbackProvider:
         self._routes = {_name(provider): provider for provider in self.providers}
         self._status_callback = None
         self._local = threading.local()
+        self._stats = {id(provider): dict(state='waiting', detail='Awaiting the first lookup.',
+                       lookups=0, matches=0, downloads=0) for provider in self.providers}
+
+    def _activity(self, provider, state, detail='', **counts):
+        with self._lock:
+            stats = self._stats[id(provider)]
+            # A paid request can finish after another worker exhausts quota.
+            # Retain the source suspension while still counting its result.
+            if id(provider) not in self._disabled:
+                stats.update(state=state, detail=safe_detail(detail) if detail else state.replace('_', ' '))
+            for key, value in counts.items():
+                stats[key] += value
+
+    def _trace(self, provider, code):
+        outcomes = getattr(self._local, 'outcomes', None)
+        if outcomes is None:
+            outcomes = self._local.outcomes = {}
+        # Known service names and normalized result codes only, never remote text.
+        code = re.sub(r'[^a-z0-9_ ]', '', str(code).casefold())[:50] or 'source_failure'
+        outcomes[_name(provider)] = code.replace('_', ' ')
+
+    def attempt_summary(self) -> str:
+        return '; '.join(name+': '+result for name, result in getattr(self._local, 'outcomes', {}).items())[:1000]
+
+    def source_statuses(self) -> tuple[SourceSnapshot, ...]:
+        with self._lock:
+            copied = [(provider, dict(self._stats[id(provider)])) for provider in self.providers]
+        rows = []
+        for provider, stats in copied:
+            reader = getattr(provider, 'request_stats', None)
+            network = reader() if callable(reader) else {}
+            remaining = network.get('remaining')
+            rows.append(SourceSnapshot(_name(provider), **stats,
+                requests=network.get('requests', 0), api_requests=network.get('api_requests', 0),
+                remaining=remaining if isinstance(remaining, int) and not isinstance(remaining, bool) else None))
+        return tuple(rows)
+
+    def check_sources(self, checkpoint: Checkpoint):
+        """Explicit idle diagnostics: API adapters bypass cached authentication."""
+        for provider in self.providers:
+            checkpoint()
+            self._activity(provider, 'checking', 'Checking source access…')
+            try:
+                check = getattr(provider, 'check_connection', None)
+                if callable(check):
+                    detail = check(checkpoint)
+                    self._activity(provider, 'checked', detail)
+                else:
+                    provider.prepare(checkpoint)
+                    self._activity(provider, 'prepared', 'Catalogue preparation succeeded. This may use cached data; no account authentication is implied.')
+                self._ready.add(id(provider))
+            except Cancelled:
+                raise
+            except Exception as error:
+                self._failed(provider, error, preparing=True)
 
     def set_status_callback(self, callback):
         self._status_callback = callback
@@ -108,7 +180,13 @@ class FallbackProvider:
         info = error_diagnostic(error)
         with self._lock:
             identifier = id(provider)
-            self._errors[identifier] = info
+            previous = self._errors.get(identifier)
+            severity = {'authentication': 3, 'quota_exhausted': 2, 'allowance_unconfirmed': 1}
+            preserve = (identifier in self._disabled and previous is not None
+                        and severity.get(previous[0], 0) > severity.get(info[0], 0))
+            if not preserve:
+                self._errors[identifier] = info
+                self._stats[identifier].update(state=info[0], detail=info[1])
             if isinstance(error, (AuthenticationError, QuotaError)):
                 self._disabled[identifier] = _name(provider)
             elif info[2] or preparing:
@@ -119,7 +197,7 @@ class FallbackProvider:
         with self._lock:
             failures = [(_name(provider), self._errors.get(id(provider),
                          ('source_failure', 'The source is unavailable.', False))) for provider in providers]
-        return _SourceFailure(failures)
+        return _SourceFailure(failures, self.attempt_summary())
 
     def prepare(self, checkpoint: Checkpoint):
         checkpoint()
@@ -131,6 +209,7 @@ class FallbackProvider:
                 if id(provider) in self._ready or self._unavailable(provider):
                     continue
                 checkpoint()
+                self._activity(provider, 'preparing', 'Preparing the source catalogue…')
                 try:
                     provider.prepare(checkpoint)
                 except Cancelled:
@@ -140,6 +219,7 @@ class FallbackProvider:
                     self._status(f'{_name(provider)} could not prepare; continuing with the other artwork sources.')
                 else:
                     self._ready.add(id(provider))
+                    self._activity(provider, 'prepared', 'Catalogue ready. Cached preparation does not verify account credentials.')
                     with self._lock:
                         self._cooldowns.pop(id(provider), None)
             self._prepared = True
@@ -153,15 +233,25 @@ class FallbackProvider:
 
     def candidates(self, game: Game, checkpoint: Checkpoint):
         self._local.missing = ('no_match', 'No unambiguous front cover was found in the available sources.')
-        self.prepare(checkpoint)
+        self._local.outcomes = {}
+        try:
+            self.prepare(checkpoint)
+        except ProviderError:
+            for provider in self.providers:
+                if self._unavailable(provider):
+                    self._trace(provider, self._errors.get(id(provider), ('source_failure',))[0])
+            raise self._failure(self.providers) from None
         failed, unmatched = [], []
         for provider in self.providers:
             checkpoint()
             if self._unavailable(provider):
                 failed.append(provider)
+                self._trace(provider, self._errors.get(id(provider), ('source_failure',))[0])
                 continue
             matches = None
             try:
+                self._activity(provider, 'searching', 'Checking the game in this source.', lookups=1)
+                self._trace(provider, 'searching')
                 nested = getattr(provider, 'candidates', None)
                 if callable(nested):
                     matches = iter(nested(game, checkpoint))
@@ -174,6 +264,8 @@ class FallbackProvider:
                     if artwork is None:
                         continue
                     found_any = True
+                    self._activity(provider, 'matched', 'A matching cover candidate was found.', matches=1)
+                    self._trace(provider, 'matched')
                     with self._lock:
                         previous = self._routes.get(artwork.source)
                         if previous is not None and previous is not provider:
@@ -184,10 +276,13 @@ class FallbackProvider:
                     reporter = getattr(provider, 'missing_reason', None)
                     code, detail = reporter(game) if callable(reporter) else ('no_match', 'No unambiguous front cover was found.')
                     unmatched.append((str(code), f'{_name(provider)}: {safe_detail(detail)}'))
+                    self._activity(provider, str(code), detail)
+                    self._trace(provider, code)
             except Cancelled:
                 raise
             except Exception as error:
-                self._failed(provider, error)
+                info = self._failed(provider, error)
+                self._trace(provider, info[0])
                 failed.append(provider)
                 self._status(f'{_name(provider)} lookup failed; trying the next artwork source.')
             finally:
@@ -200,6 +295,8 @@ class FallbackProvider:
                 return (4 if 'ambiguous' in code else 3 if any(word in code for word in ('region', 'revision', 'edition', 'policy'))
                         else 2 if 'cover' in code or 'artwork' in code else 0 if 'unsupported' in code else 1)
             self._local.missing = max(unmatched, key=importance)
+            code, detail = self._local.missing
+            self._local.missing = (code, safe_detail(detail+' Sources tried: '+self.attempt_summary()))
         if failed:
             raise self._failure(failed)
 
@@ -216,15 +313,21 @@ class FallbackProvider:
             provider = self._routes.get(artwork.source)
         if provider is None:
             raise ProviderError('The artwork source could not be identified.')
-        if self._unavailable(provider):
+        with self._lock:
+            quota_only = self._errors.get(id(provider), ('',))[0] in {'quota_exhausted', 'allowance_unconfirmed'}
+        if self._unavailable(provider) and not quota_only:
+            self._trace(provider, self._errors.get(id(provider), ('source_failure',))[0])
             raise self._failure([provider])
         try:
             provider.download(artwork, destination, checkpoint)
+            self._activity(provider, 'downloaded', 'Artwork saved successfully.', downloads=1)
+            self._trace(provider, 'downloaded')
         except (Cancelled, FileExistsError):
             # Publication races are local recovery, not a remote source outage.
             raise
         except Exception as error:
-            self._failed(provider, error)
+            info = self._failed(provider, error)
+            self._trace(provider, info[0])
             if isinstance(error, (AuthenticationError, QuotaError)):
                 self._status(f'{_name(provider)} is unavailable; continuing with the other artwork sources.')
                 raise self._failure([provider]) from None

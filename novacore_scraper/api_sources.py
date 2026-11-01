@@ -68,9 +68,13 @@ _PLATFORM_SYNONYMS = {
 }
 _SYSTEM_EQUIVALENTS = {
     'genesis': 'megadrive', 'famicom': 'nes', 'snesmsu1': 'snes', 'n3ds': '3ds',
+    'snes-msu1': 'snes', 'megadrive-msu': 'megadrive',
     '32x': 'sega32x', 'megacd': 'segacd', 'ps1': 'psx', 'lynx': 'atarilynx',
-    'jaguar': 'atarijaguar', 'amiga500': 'amiga', 'amiga1200': 'amiga',
+    'jaguar': 'atarijaguar', 'amiga500': 'amiga', 'amiga1200': 'amiga', 'amiga4000': 'amiga',
+    'bbcmicro': 'bbc', 'wswan': 'wonderswan', 'wswanc': 'wonderswancolor',
     'msx1': 'msx', 'arcade': 'mame', 'fbneo': 'mame',
+    'cps1': 'mame', 'cps2': 'mame', 'cps3': 'mame', 'cave': 'mame',
+    'segastv': 'mame', 'model2': 'mame', 'model3': 'mame',
 }
 _CACHE_VERSION = 2
 _MEMORY_ENTRIES = 512
@@ -305,9 +309,17 @@ class TheGamesDBProvider(_APIProvider):
         self._secrets = (self._api_key,)
         self._quota_lock = threading.Lock()
         self._remaining = None
+        self._reported_remaining = None
 
     def _trusted_host(self, host):
         return host in {'api.thegamesdb.net', 'cdn.thegamesdb.net'}
+
+    def request_stats(self):
+        result = super().request_stats()
+        with self._quota_lock:
+            result['remaining'] = self._reported_remaining
+            result['local_budget'] = self._remaining
+        return result
 
     def _before_request(self):
         super()._before_request()
@@ -315,7 +327,16 @@ class TheGamesDBProvider(_APIProvider):
             with self._quota_lock:
                 if self._remaining is not None:
                     if self._remaining <= 0:
-                        self._stop(QuotaError, 'TheGamesDB API allowance is exhausted. Resume after it resets.')
+                        # Deny new API dispatches without poisoning paid-for
+                        # responses already being read or public cover downloads.
+                        if self._reported_remaining == 0:
+                            raise QuotaError('TheGamesDB API allowance is exhausted. Resume after it resets.')
+                        reported = 'unknown' if self._reported_remaining is None else str(self._reported_remaining)
+                        error = QuotaError('TheGamesDB local request budget is exhausted; the last reported server allowance '
+                                           'was ' + reported + '. Pending requests or request errors prevent confirming '
+                                           'the current server allowance.')
+                        error.reason, error.retryable = 'allowance_unconfirmed', False
+                        raise error
                     self._remaining -= 1
 
     def _json(self, endpoint, checkpoint, **params):
@@ -344,8 +365,22 @@ class TheGamesDBProvider(_APIProvider):
         except (ValueError, TypeError, KeyError, OverflowError):
             raise ProviderError('TheGamesDB returned invalid API allowance data.') from None
         with self._quota_lock:
+            self._reported_remaining = remaining
             self._remaining = remaining if self._remaining is None else min(self._remaining, remaining)
         return data
+
+    def check_connection(self, checkpoint: Checkpoint) -> str:
+        """Verify the account with a fresh read-only API request, bypassing caches."""
+        _Provider.prepare(self, checkpoint)
+        with self._prepare_lock:
+            checkpoint()
+            if not self._api_key:
+                self._stop(AuthenticationError, 'Enter your own TheGamesDB API key to enable this source.')
+            platforms = self._load_platforms(checkpoint)
+            if not platforms or not self._valid_rows(platforms, False):
+                raise ProviderError('TheGamesDB returned an invalid platform catalog.')
+            self._platforms = platforms
+        return 'Authenticated API request succeeded.'
 
     def prepare(self, checkpoint: Checkpoint):
         super().prepare(checkpoint)
@@ -500,6 +535,19 @@ class IGDBProvider(_APIProvider):
                 self._stop(AuthenticationError, 'Enter your own Twitch application client ID and secret to enable IGDB.')
             if self._platforms is None:
                 self._platforms = self._cached('platforms', lambda: self._load_platforms(checkpoint), checkpoint)
+
+    def check_connection(self, checkpoint: Checkpoint) -> str:
+        """Verify Twitch authentication and a fresh IGDB platform API response."""
+        _Provider.prepare(self, checkpoint)
+        with self._prepare_lock:
+            checkpoint()
+            if not self._client_id or not self._client_secret:
+                self._stop(AuthenticationError, 'Enter your own Twitch application client ID and secret to enable IGDB.')
+            platforms = self._load_platforms(checkpoint)
+            if not platforms or not self._valid_rows(platforms, False):
+                raise ProviderError('IGDB returned an invalid platform catalog.')
+            self._platforms = platforms
+        return 'Authenticated API request succeeded.'
 
     def _load_platforms(self, checkpoint):
         platforms = {}

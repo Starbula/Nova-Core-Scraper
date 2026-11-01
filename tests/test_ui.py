@@ -395,7 +395,7 @@ class TkTests(unittest.TestCase):
         self.assertEqual(self.app.selection.selected, set())
         self.assertTrue(self.app.start_button.instate(['disabled']))
         self.assertEqual([self.app.notebook.tab(tab, 'text') for tab in self.app.notebook.tabs()],
-                         ['Library', 'Downloads', 'Downloaded', 'Settings'])
+                         ['Library', 'Downloads', 'Downloaded', 'Sources', 'Settings'])
         self.app.show_settings()
         self.assertEqual(self.app.notebook.select(), str(self.app.settings_tab))
         self.assertIsNone(self.app._settings_window)
@@ -466,7 +466,8 @@ class TkTests(unittest.TestCase):
         with patch.object(ui, 'data_directory', return_value=Path(self.temp.name)):
             standalone = self.app._make_provider()
         self.addCleanup(standalone.close)
-        self.assertIsInstance(standalone,ui.LaunchBoxProvider)
+        self.assertIsInstance(standalone,ui.FallbackProvider)
+        self.assertEqual([type(source) for source in standalone.providers], [ui.LaunchBoxProvider])
 
     def test_optional_sources_remain_unconfigured_until_their_credentials_are_complete(self):
         self.install_console_fixture()
@@ -494,7 +495,7 @@ class TkTests(unittest.TestCase):
         self.addCleanup(provider.close)
         self.assertEqual([type(source) for source in provider.providers],
                          [ui.LibretroProvider, ui.LaunchBoxProvider, ui.GameTDBProvider,
-                          ui.ScreenScraperProvider, ui.TheGamesDBProvider, ui.IGDBProvider, ui.MobyGamesProvider])
+                          ui.ScreenScraperProvider, ui.IGDBProvider, ui.TheGamesDBProvider, ui.MobyGamesProvider])
         for source in provider.providers:
             if isinstance(source, ui.ScreenScraperProvider):
                 continue
@@ -666,7 +667,7 @@ class TkTests(unittest.TestCase):
         self.addCleanup(provider.close)
         self.assertEqual([type(source) for source in provider.providers],
                          [ui.LibretroProvider, ui.LaunchBoxProvider, ui.GameTDBProvider,
-                          ui.ScreenScraperProvider, ui.TheGamesDBProvider, ui.IGDBProvider, ui.MobyGamesProvider])
+                          ui.ScreenScraperProvider, ui.IGDBProvider, ui.TheGamesDBProvider, ui.MobyGamesProvider])
         self.assertEqual([game.system.name for game in captured[0].games], ['gba'])
 
     def test_close_finishes_latest_queued_credential_save(self):
@@ -743,6 +744,183 @@ class TkTests(unittest.TestCase):
         detail = self.app.jobs_tree.set('gba/game', 'detail')
         for value in ('No front cover', 'GameTDB', 'us', 'Base-game cover for Disc 2', '3'):
             self.assertIn(value, detail)
+
+    def test_sources_tab_distinguishes_blocked_application_from_unverified_account_configuration(self):
+        with patch.object(ui.auth, 'screen_scraper_app_credentials', return_value=None):
+            self.app.account_username_var.set('my-account')
+            self.app.account_password_var.set('my-password')
+            self.app._render_sources(force=True)
+        self.assertEqual(len(self.app.sources_tree.get_children()), 7)
+        self.assertEqual(self.app.sources_tree.set('screenscraper', 'state'), 'Blocked')
+        self.app.sources_tree.selection_set('screenscraper')
+        self.app._source_selected()
+        detail = self.app.source_detail_text.get('1.0', 'end')
+        self.assertIn('NovaCore', detail)
+        self.assertIn('application credentials', detail)
+        self.assertIn('account', detail.lower())
+        self.assertNotIn('my-password', detail)
+        self.app.tgdb_key_var.set('my-key')
+        self.app._render_sources(force=True)
+        self.assertEqual(self.app.sources_tree.set('thegamesdb', 'state'), 'Configured, unverified')
+
+    def test_sources_show_frozen_actual_chain_and_throttle_snapshot_reads(self):
+        from types import SimpleNamespace
+        snapshots = (
+            SimpleNamespace(name='IGDB', state='no_match', detail='No matching game.', lookups=4, matches=0,
+                            downloads=0, requests=3, api_requests=2, remaining=None),
+            SimpleNamespace(name='TheGamesDB', state='quota_exhausted', detail='Monthly API allowance exhausted.',
+                            lookups=1, matches=0, downloads=0, requests=1, api_requests=1, remaining=0),
+        )
+        calls = []
+        def statuses():
+            calls.append(threading.get_ident())
+            return snapshots
+        self.app.engine = SimpleNamespace(active=True, provider=SimpleNamespace(source_statuses=statuses),
+                                           snapshot=lambda:Progress(state='Scraping'))
+        self.app.provider_setting_var.set('libretro')
+        self.app._render_sources(force=True)
+        self.assertIn('IGDB → TheGamesDB', self.app.source_chain_var.get())
+        self.assertEqual(self.app.sources_tree.get_children()[:2], ('igdb', 'thegamesdb'))
+        self.assertEqual(self.app.sources_tree.set('thegamesdb', 'state'), 'Quota exhausted')
+        self.assertEqual(self.app.sources_tree.set('thegamesdb', 'remaining'), '0')
+        self.assertEqual(self.app.sources_tree.set('igdb', 'lookups'), '4')
+        self.assertEqual(self.app.sources_tree.set('igdb', 'api_requests'), '2')
+        self.assertEqual(self.app.sources_tree.set('igdb', 'requests'), '3')
+        self.assertEqual(self.app.sources_tree.set('libretro', 'state'), 'Not enabled in this run')
+        reads = len(calls)
+        for _ in range(10):
+            self.app._render_sources()
+        self.assertEqual(len(calls), reads)
+        self.app.sources_tree.selection_set('thegamesdb')
+        self.app._source_selected()
+        self.assertIn('Monthly API allowance exhausted', self.app.source_detail_text.get('1.0', 'end'))
+
+    def test_explicit_source_check_runs_off_tk_and_retains_fresh_diagnostics(self):
+        from types import SimpleNamespace
+        self.install_console_fixture()
+        self.app.select_console('gba')
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        owner, threads, closed = threading.get_ident(), [], []
+        state = ['waiting']
+        class Provider:
+            def source_statuses(self):
+                return (SimpleNamespace(name='TheGamesDB', state=state[0], detail='Fresh server quota response.',
+                    lookups=0, matches=0, downloads=0, requests=1 if state[0] != 'waiting' else 0,
+                    api_requests=1 if state[0] != 'waiting' else 0, remaining=0),)
+            def check_sources(self, checkpoint):
+                threads.append(threading.get_ident())
+                entered.set()
+                while not release.wait(.01):
+                    checkpoint()
+                checkpoint()
+                state[0] = 'quota_exhausted'
+            def close(self):
+                closed.append(True)
+        provider = Provider()
+        with patch.object(self.app, '_make_provider', return_value=provider):
+            self.app.check_sources()
+            self.pump_until(entered.is_set)
+            self.assertTrue(self.app.start_button.instate(['disabled']))
+            self.assertTrue(self.app.check_sources_button.instate(['disabled']))
+            self.app.start()
+            self.assertIsNone(self.app.engine)
+            release.set()
+            self.pump_until(lambda:'sources-check' not in self.app._background_threads)
+        self.assertNotEqual(threads, [owner])
+        self.assertEqual(closed, [True])
+        self.assertIs(self.app._diagnostic_provider, provider)
+        self.assertIn('Source check order', self.app.source_chain_var.get())
+        self.assertEqual(self.app.sources_tree.set('thegamesdb', 'state'), 'Quota exhausted')
+        self.assertEqual(self.app.sources_tree.set('thegamesdb', 'api_requests'), '1')
+        self.assertTrue(self.app.start_button.instate(['!disabled']))
+
+    def test_source_check_status_takes_priority_over_previous_finished_run(self):
+        from types import SimpleNamespace
+        self.app.engine = SimpleNamespace(active=False, snapshot=lambda:Progress(state='Finished', message='Previous run finished.'))
+        self.app._diagnostic_provider = object()
+        self.app._background_threads['sources-check'] = None
+        self.app.status_var.set('Checking sources with actual service requests…')
+        self.app._render_progress()
+        self.assertEqual(self.app.status_var.get(), 'Checking sources with actual service requests…')
+        self.assertEqual(self.app.state_var.get(), 'Checking')
+        self.app._background_threads.pop('sources-check')
+        self.app.status_var.set('Source check finished. Review source statuses.')
+        self.app._render_progress()
+        self.assertEqual(self.app.status_var.get(), 'Source check finished. Review source statuses.')
+        self.app._diagnostic_provider = None
+        self.app._render_progress()
+        self.assertEqual(self.app.status_var.get(), 'Previous run finished.')
+
+    def test_stop_cancels_explicit_source_check_without_closing_the_window(self):
+        entered, closed = threading.Event(), threading.Event()
+        class Provider:
+            def source_statuses(self):
+                return ()
+            def check_sources(self, checkpoint):
+                entered.set()
+                while True:
+                    checkpoint()
+                    time.sleep(.005)
+            def close(self):
+                closed.set()
+        with patch.object(self.app, '_make_provider', return_value=Provider()):
+            self.app.check_sources()
+            self.pump_until(entered.is_set)
+            self.assertTrue(self.app.stop_button.instate(['!disabled']))
+            self.app.stop_button.invoke()
+            self.pump_until(lambda:'sources-check' not in self.app._background_threads)
+        self.assertTrue(closed.is_set())
+        self.assertTrue(self.root.winfo_exists())
+        self.assertIn('stopped', self.app.status_var.get().lower())
+
+    def test_close_cancels_explicit_source_check_and_closes_its_provider(self):
+        entered, closed = threading.Event(), threading.Event()
+        class Provider:
+            def source_statuses(self):
+                return ()
+            def check_sources(self, checkpoint):
+                entered.set()
+                while True:
+                    checkpoint()
+                    time.sleep(.005)
+            def close(self):
+                closed.set()
+        with patch.object(self.app, '_make_provider', return_value=Provider()):
+            self.app.check_sources()
+            self.pump_until(entered.is_set)
+            started = time.monotonic()
+            self.app.close()
+            self.assertLess(time.monotonic()-started, .2)
+            deadline = time.monotonic()+3
+            while time.monotonic() < deadline:
+                try:
+                    self.root.update()
+                    if not self.root.winfo_exists():
+                        break
+                except tk.TclError:
+                    break
+                time.sleep(.005)
+        self.assertTrue(closed.is_set())
+        self.assertTrue(self.app._diagnostic_cancel.is_set())
+
+    def test_selected_game_details_show_full_source_trace_without_a_new_window(self):
+        from types import SimpleNamespace
+        from novacore_scraper.engine import JobSnapshot
+        trace = 'Libretro: no_title_match\nIGDB: no_front_cover\nTheGamesDB: quota_exhausted'
+        row = JobSnapshot('gba/trace', 'Trace game', 'GBA', 'failed', detail='Sources could not provide artwork.',
+                          source='TheGamesDB', source_trace=trace)
+        self.app.engine = SimpleNamespace(active=False, jobs_revision=1, snapshot=lambda:Progress(),
+                                          jobs_page=lambda **options:([row], 1))
+        self.app._request_page('jobs')
+        self.pump_until(lambda:self.app.jobs_tree.exists(row.key))
+        self.app.jobs_tree.selection_set(row.key)
+        self.app._show_job_details('jobs')
+        detail = self.app._pages['jobs']['detail_text'].get('1.0', 'end')
+        self.assertIn(trace, detail)
+        self.assertIn('Trace game', detail)
+        self.assertEqual(str(self.app._pages['jobs']['detail_text'].cget('state')), 'disabled')
+        self.assertFalse(any(isinstance(widget, tk.Toplevel) for widget in self.root.winfo_children()))
 
     def test_poll_updates_only_reported_console_covers_without_rescanning_games(self):
         from types import SimpleNamespace

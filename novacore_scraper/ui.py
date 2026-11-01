@@ -19,7 +19,7 @@ from .engine import ScrapeEngine
 from .library import detect_installations
 from .scan import scan_library
 from .models import Game, System
-from .providers import LibretroProvider, ScreenScraperProvider
+from .providers import LibretroProvider, ScreenScraperProvider, Cancelled
 from .launchbox import LaunchBoxProvider
 from .gametdb import GameTDBProvider
 from .api_sources import TheGamesDBProvider, IGDBProvider
@@ -57,6 +57,14 @@ SOURCE_NAMES = {'libretro': 'Libretro', 'launchbox': 'LaunchBox', 'gametdb': 'Ga
                 'screenscraper': 'ScreenScraper', 'thegamesdb': 'TheGamesDB',
                 'igdb': 'IGDB', 'mobygames': 'MobyGames'}
 CREDENTIALS_LOADING = 'Loading saved provider credentials…'
+SOURCE_ORDER = ('libretro', 'launchbox', 'gametdb', 'screenscraper', 'igdb', 'thegamesdb', 'mobygames')
+SOURCE_STATES = {'waiting': 'Waiting', 'preparing': 'Preparing', 'prepared': 'Prepared',
+                 'searching': 'Searching', 'no_match': 'No match', 'matched': 'Matched',
+                 'downloaded': 'Downloaded', 'quota_exhausted': 'Quota exhausted',
+                 'authentication': 'Authentication rejected', 'temporary_failure': 'Temporary failure',
+                 'source_failure': 'Source failure', 'invalid_response': 'Invalid response',
+                 'local_error': 'Local error', 'no_artwork': 'No front cover',
+                 'allowance_unconfirmed': 'Budget unconfirmed'}
 
 
 def _dark_window(window: tk.Tk | tk.Toplevel) -> None:
@@ -250,6 +258,10 @@ class App:
         self._last_page_check = 0.0
         self._pages = {}
         self._console_names = {}
+        self._last_source_check = 0.0
+        self._source_details = {}
+        self._diagnostic_provider = None
+        self._diagnostic_cancel = threading.Event()
         self.folder_var = tk.StringVar(value=self.settings.retrobat_folder)
         self.console_var = tk.StringVar(value='Choose one console')
         self.filter_var = tk.StringVar()
@@ -262,6 +274,7 @@ class App:
         self.provider_var = tk.StringVar()
         self.auth_status_var = tk.StringVar()
         self.sources_status_var = tk.StringVar()
+        self.source_chain_var = tk.StringVar()
         self.settings_status_var = tk.StringVar()
         self.provider_setting_var = tk.StringVar(value=self.settings.provider)
         self.region_setting_var = tk.StringVar(value=self.settings.region)
@@ -323,15 +336,17 @@ class App:
         self.library_tab = ttk.Frame(self.notebook, padding=12)
         self.downloads_tab = ttk.Frame(self.notebook, padding=12)
         self.downloaded_tab = ttk.Frame(self.notebook, padding=12)
+        self.sources_tab = ttk.Frame(self.notebook, padding=12)
         self.settings_tab = ttk.Frame(self.notebook, padding=12)
         for tab, label in ((self.library_tab, 'Library'), (self.downloads_tab, 'Downloads'),
-                           (self.downloaded_tab, 'Downloaded'), (self.settings_tab, 'Settings')):
+                           (self.downloaded_tab, 'Downloaded'), (self.sources_tab, 'Sources'), (self.settings_tab, 'Settings')):
             self.notebook.add(tab, text=label)
         self._build_library()
         self._build_job_page('jobs', self.downloads_tab)
         self._build_job_page('downloaded', self.downloaded_tab)
         self.jobs_tree = self._pages['jobs']['tree']
         self.downloaded_tree = self._pages['downloaded']['tree']
+        self._build_sources()
         self._build_settings()
         self.notebook.bind('<<NotebookTabChanged>>', self._tab_changed)
         actions = ttk.Frame(main)
@@ -452,7 +467,8 @@ class App:
         horizontal = ttk.Scrollbar(table, orient='horizontal', command=tree.xview)
         horizontal.grid(row=1, column=0, sticky='ew')
         tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
-        tree.bind('<<TreeviewSelect>>', lambda _event: self._refresh_buttons())
+        tree.bind('<<TreeviewSelect>>', lambda _event: self._job_selected(name))
+        tree.bind('<Double-1>', lambda _event:self._show_job_details(name))
         footer = ttk.Frame(tab)
         footer.grid(row=2, column=0, sticky='ew', pady=(8, 0))
         footer.columnconfigure(1, weight=1)
@@ -462,6 +478,7 @@ class App:
         ttk.Label(footer, textvariable=label, anchor='center').grid(row=0, column=1, sticky='ew')
         next_button = ttk.Button(footer, text='Next', command=lambda: self._change_page(name, 1))
         next_button.grid(row=0, column=2)
+        ttk.Button(footer, text='Show details', command=lambda:self._show_job_details(name)).grid(row=0, column=3, padx=(8, 0))
         if name == 'jobs':
             cancel = ttk.Frame(tab)
             cancel.grid(row=3, column=0, sticky='ew', pady=(10, 0))
@@ -473,11 +490,177 @@ class App:
             self.export_results_button = ttk.Button(cancel, text='Export results…', command=self.export_results)
             self.export_results_button.grid(row=0, column=3, padx=(12, 0))
             ttk.Label(tab, text='Filter Missing or Failed to review unresolved games. Export includes all results and match notes.').grid(row=4, column=0, sticky='w', pady=(8, 0))
+        details = ttk.LabelFrame(tab, text='Selected game · source attempts and result', padding=8)
+        details.grid(row=5, column=0, sticky='ew', pady=(8, 0))
+        details.columnconfigure(0, weight=1)
+        detail_text = tk.Text(details, height=6, wrap='word', background=DARK_COLORS['field'],
+            foreground=DARK_COLORS['foreground'], insertbackground=DARK_COLORS['foreground'],
+            selectbackground=DARK_COLORS['selection'], relief='flat', state='disabled')
+        detail_text.grid(row=0, column=0, sticky='ew')
+        detail_scroll = ttk.Scrollbar(details, orient='vertical', command=detail_text.yview)
+        detail_scroll.grid(row=0, column=1, sticky='ns')
+        detail_text.configure(yscrollcommand=detail_scroll.set)
+        ttk.Button(details, text='Hide details', command=details.grid_remove).grid(row=1, column=0, sticky='e', pady=(6, 0))
+        details.grid_remove()
         self._pages[name] = dict(tree=tree, query=query, status=status, offset=0, total=0, label=label,
                                  previous=previous, next=next_button, after=None, requested=None,
-                                 applied=None, ticket=0)
+                                 applied=None, ticket=0, rows={}, detail_frame=details, detail_text=detail_text)
         query.trace_add('write', lambda *_args: self._page_search_changed(name))
         status.trace_add('write', lambda *_args: self._page_status_changed(name))
+
+    @staticmethod
+    def _set_readonly_text(widget, value) -> None:
+        widget.configure(state='normal')
+        widget.delete('1.0', 'end')
+        widget.insert('1.0', value)
+        widget.configure(state='disabled')
+
+    def _job_selected(self, name) -> None:
+        self._refresh_buttons()
+        page = self._pages[name]
+        selected = page['tree'].selection()
+        row = page['rows'].get(selected[0]) if selected else None
+        if row is None:
+            self._set_readonly_text(page['detail_text'], 'Select a game to inspect its result and source attempts.')
+            return
+        lines = [f'{row.title} · {row.console}', f'Status: {row.status.replace("_", " ")}', row.detail]
+        for field, label in (('reason', 'Reason'), ('source', 'Source'), ('region', 'Region'),
+                             ('match_note', 'Match note'), ('artwork', 'Artwork'), ('attempts', 'Attempts')):
+            value = getattr(row, field, '')
+            if value:
+                lines.append(f'{label}: {value}')
+        trace = getattr(row, 'source_trace', '')
+        lines.append('Source attempts:\n' + trace if trace else 'No source-attempt trace is recorded for this result.')
+        self._set_readonly_text(page['detail_text'], '\n'.join(line for line in lines if line))
+
+    def _show_job_details(self, name) -> None:
+        self._pages[name]['detail_frame'].grid()
+        self._job_selected(name)
+
+    def _build_sources(self) -> None:
+        tab = self.sources_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        controls = ttk.Frame(tab)
+        controls.grid(row=0, column=0, sticky='ew', pady=(0, 10))
+        controls.columnconfigure(0, weight=1)
+        header = ttk.Label(controls, textvariable=self.source_chain_var, wraplength=700)
+        header.grid(row=0, column=0, sticky='ew', padx=(0, 10))
+        self.check_sources_button = ttk.Button(controls, text='Check sources', command=self.check_sources)
+        self.check_sources_button.grid(row=0, column=1, sticky='e')
+        table = ttk.Frame(tab)
+        table.grid(row=1, column=0, sticky='nsew')
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        columns = ('source', 'state', 'lookups', 'matches', 'downloads', 'api_requests', 'requests', 'remaining')
+        self.sources_tree = ttk.Treeview(table, columns=columns, show='headings', height=7, selectmode='browse')
+        for key, heading, width in (
+            ('source', 'Source', 135), ('state', 'Status', 155), ('lookups', 'Game checks', 90),
+            ('matches', 'Matches', 65), ('downloads', 'Covers saved', 90), ('api_requests', 'API requests', 90),
+            ('requests', 'HTTP attempts', 95), ('remaining', 'Last quota', 95)):
+            self.sources_tree.heading(key, text=heading)
+            self.sources_tree.column(key, width=width, minwidth=55, stretch=key in ('source', 'state'),
+                                     anchor='w' if key in ('source', 'state') else 'e')
+        self.sources_tree.grid(row=0, column=0, sticky='nsew')
+        horizontal = ttk.Scrollbar(table, orient='horizontal', command=self.sources_tree.xview)
+        horizontal.grid(row=1, column=0, sticky='ew')
+        vertical = ttk.Scrollbar(table, orient='vertical', command=self.sources_tree.yview)
+        vertical.grid(row=0, column=1, sticky='ns')
+        self.sources_tree.configure(xscrollcommand=horizontal.set, yscrollcommand=vertical.set)
+        self.sources_tree.bind('<<TreeviewSelect>>', self._source_selected)
+        details = ttk.LabelFrame(tab, text='Selected source · access and latest result', padding=8)
+        details.grid(row=2, column=0, sticky='ew', pady=(10, 8))
+        details.columnconfigure(0, weight=1)
+        self.source_detail_text = tk.Text(details, height=4, wrap='word', background=DARK_COLORS['field'],
+            foreground=DARK_COLORS['foreground'], selectbackground=DARK_COLORS['selection'],
+            relief='flat', state='disabled')
+        self.source_detail_text.grid(row=0, column=0, sticky='ew')
+        scroll = ttk.Scrollbar(details, orient='vertical', command=self.source_detail_text.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
+        self.source_detail_text.configure(yscrollcommand=scroll.set)
+        footer = ttk.Label(tab, text='Game checks are source lookups. API requests count service API calls; HTTP attempts include catalogue and image requests. '
+            'Neither is a count of covers saved. Cached results may need zero network requests. Each game tries sources in the displayed order; parallel games may use different sources at the same time. '
+            'Check sources sends real service requests and may use API quota. Server-reported quota may lag in-flight requests. '
+            'Configured credentials are unverified until the service accepts an actual request. Data by MobyGames.com.', wraplength=850)
+        footer.grid(row=3, column=0, sticky='ew')
+        tab.bind('<Configure>', lambda event:(header.configure(wraplength=max(240, event.width-150)),
+                                            footer.configure(wraplength=max(240, event.width-20))))
+        self._render_sources(force=True)
+
+    def _idle_source(self, key):
+        if key in ('libretro', 'launchbox', 'gametdb'):
+            return 'Available', ('No account required. Access and artwork availability are checked during a run.'
+                                 + (' GameTDB covers verified Wii and GameCube games.' if key == 'gametdb' else ''))
+        if key == 'screenscraper' and not auth.screen_scraper_app_credentials():
+            return 'Blocked', ('ScreenScraper requires approved NovaCore application credentials as well as your account. '
+                               'An entered username and password alone cannot enable this source.')
+        if self._source_ready(key):
+            return 'Configured, unverified', 'Credentials are configured. This does not prove service access; authentication and quota are checked on an actual request.'
+        return 'Unconfigured', 'Enter your authorized account or API credentials in Settings to enable this optional source.'
+
+    def _display_source_provider(self):
+        if self.engine and self.engine.active:
+            return getattr(self.engine, 'provider', None)
+        return self._diagnostic_provider or getattr(self.engine, 'provider', None)
+
+    def _render_sources(self, *, force=False) -> None:
+        now = time.monotonic()
+        if not force and now-self._last_source_check < .5:
+            return
+        self._last_source_check = now
+        provider = self._display_source_provider()
+        getter = getattr(provider, 'source_statuses', None)
+        actual = callable(getter)
+        try:
+            snapshots = tuple(getter()) if actual else ()
+        except Exception as exc:
+            LOG.warning('Could not read source status (%s)', type(exc).__name__)
+            snapshots = ()
+        names = {''.join(character for character in name.casefold() if character.isalnum()):key
+                 for key, name in SOURCE_NAMES.items()}
+        by_key = {names.get(''.join(character for character in row.name.casefold() if character.isalnum())):row
+                  for row in snapshots}
+        chain = ' → '.join(row.name for row in snapshots)
+        if actual:
+            active = bool(self.engine and self.engine.active)
+            prefix = 'Source check order: ' if provider is self._diagnostic_provider and not active else 'Active run order: ' if active else 'Last run order: '
+            self.source_chain_var.set(prefix + (chain or 'Status unavailable.'))
+            if active and chain:
+                self.provider_var.set('Running · ' + chain + '. See Sources for access, requests and results.')
+        else:
+            configured = [key for key in SOURCE_ORDER if self._source_ready(key)]
+            selected = self.provider_setting_var.get()
+            enabled = configured if selected == 'automatic' else [selected] if self._source_ready(selected) else []
+            self.source_chain_var.set('Next run order (access unverified): ' + (' → '.join(SOURCE_NAMES[key] for key in enabled) or 'Choose and configure a source in Settings.'))
+        selected = self.sources_tree.selection()
+        order = [key for key in by_key if key in SOURCE_NAMES] + [key for key in SOURCE_ORDER if key not in by_key]
+        for index, key in enumerate(order):
+            row = by_key.get(key)
+            if row is not None:
+                state = SOURCE_STATES.get(row.state, row.state.replace('_', ' ').capitalize())
+                detail = row.detail or 'No additional result is available yet.'
+                metrics = (row.lookups, row.matches, row.downloads, row.api_requests, row.requests,
+                           row.remaining if row.remaining is not None else '—')
+            else:
+                state, detail = self._idle_source(key)
+                if actual:
+                    state = 'Not enabled in this run'
+                    detail = 'Not enabled in this run. ' + detail + ' Configuration changes apply to the next run.'
+                metrics = (0, 0, 0, 0, 0, '—')
+            self._source_details[key] = f'{SOURCE_NAMES[key]} · {state}\n{detail}'
+            values = (SOURCE_NAMES[key], state, *metrics)
+            if self.sources_tree.exists(key):
+                self.sources_tree.item(key, values=values)
+                self.sources_tree.move(key, '', index)
+            else:
+                self.sources_tree.insert('', 'end', iid=key, values=values)
+        if not selected and order:
+            self.sources_tree.selection_set(order[0])
+        self._source_selected()
+
+    def _source_selected(self, _event=None) -> None:
+        selected = self.sources_tree.selection()
+        self._set_readonly_text(self.source_detail_text, self._source_details.get(selected[0], '') if selected else 'Select a source for access and result details.')
 
     def _build_settings(self) -> None:
         self.settings_tab.columnconfigure(0, weight=1)
@@ -590,6 +773,7 @@ class App:
 
     def _provider_ready(self) -> bool:
         return ('credentials-load' not in self._background_threads
+                and 'sources-check' not in self._background_threads
                 and self._source_ready(self.provider_setting_var.get()))
 
     def _source_ready(self, name) -> bool:
@@ -605,7 +789,7 @@ class App:
         return name in ('automatic', 'libretro', 'launchbox', 'gametdb')
 
     def _refresh_buttons(self) -> None:
-        available = not self.busy and not self._closing
+        available = not self.busy and not self._closing and 'sources-check' not in self._background_threads
         for button in (self.browse_button, self.detect_button, self.settings_save_button):
             button.configure(state='normal' if available else 'disabled')
         self.scan_button.configure(state='normal' if available and self.retrobat_root else 'disabled')
@@ -623,11 +807,13 @@ class App:
         active = bool(self.engine and self.engine.active)
         state = self.engine.snapshot().state if active else ''
         self.pause_button.configure(text='Resume' if state == 'Paused' else 'Pause', state='normal' if active and state != 'Stopping' and not self._closing else 'disabled')
-        self.stop_button.configure(state='normal' if not self._closing and (active and state != 'Stopping' or self._worker_kind in ('scan', 'detect')) else 'disabled')
+        checking_sources = 'sources-check' in self._background_threads and not self._diagnostic_cancel.is_set()
+        self.stop_button.configure(state='normal' if not self._closing and (active and state != 'Stopping' or self._worker_kind in ('scan', 'detect') or checking_sources) else 'disabled')
         self.cancel_selected_button.configure(state='normal' if active and self.jobs_tree.selection() and not self._closing else 'disabled')
         self.cancel_all_button.configure(state='normal' if active and not self._closing else 'disabled')
         self.export_results_button.configure(state='normal' if self.retrobat_root and not self._closing
                                              and 'export' not in self._background_threads else 'disabled')
+        self.check_sources_button.configure(state='normal' if available and self._provider_ready() else 'disabled')
         for page in self._pages.values():
             page['previous'].configure(state='normal' if page['offset'] > 0 and not self._closing else 'disabled')
             page['next'].configure(state='normal' if page['offset']+PAGE_SIZE < page['total'] and not self._closing else 'disabled')
@@ -635,6 +821,9 @@ class App:
     def _provider_changed(self, *_args) -> None:
         self._refresh_provider()
         self._refresh_buttons()
+        if hasattr(self, 'sources_tree'):
+            provider = self._display_source_provider()
+            self._render_sources(force=not callable(getattr(provider, 'source_statuses', None)))
 
     def _credential_changed(self, key) -> None:
         self._credential_edited.add(key)
@@ -643,12 +832,12 @@ class App:
 
     def _refresh_provider(self) -> None:
         name = self.provider_setting_var.get()
-        configured = [SOURCE_NAMES[source] for source in ('screenscraper', 'thegamesdb', 'igdb', 'mobygames') if self._source_ready(source)]
-        unconfigured = [SOURCE_NAMES[source] for source in ('screenscraper', 'thegamesdb', 'igdb', 'mobygames') if not self._source_ready(source)]
+        configured = [SOURCE_NAMES[source] for source in ('screenscraper', 'igdb', 'thegamesdb', 'mobygames') if self._source_ready(source)]
+        unconfigured = [SOURCE_NAMES[source] for source in ('screenscraper', 'igdb', 'thegamesdb', 'mobygames') if not self._source_ready(source)]
         self.sources_status_var.set('Available without accounts: Libretro, LaunchBox, GameTDB (Wii/GameCube). '
-            + ('Configured accounts: ' + ', '.join(configured) + '. ' if configured else 'Configured accounts: none. ')
+            + ('Configured, unverified accounts: ' + ', '.join(configured) + '. ' if configured else 'Configured accounts: none. ')
             + ('Unconfigured optional sources: ' + ', '.join(unconfigured) + '.' if unconfigured else 'All optional accounts configured.')
-            + ' Service access is verified when scraping starts.')
+            + ' Actual service requests verify access; cached preparation alone does not. See Sources to check access and activity.')
         if name == 'screenscraper':
             self.auth_status_var.set(auth.screen_scraper_status())
             if not auth.screen_scraper_app_credentials():
@@ -656,7 +845,7 @@ class App:
             elif not self.account_username_var.get().strip() or not self.account_password_var.get().strip():
                 self.provider_var.set('ScreenScraper: enter your username and password in Settings before starting.')
             else:
-                self.provider_var.set('ScreenScraper account configured · Service access is verified when scraping starts.')
+                self.provider_var.set('ScreenScraper account configured, unverified · Actual service requests verify access.')
         elif name == 'libretro':
             self.provider_var.set('Libretro · Ready to download box artwork without an account.')
         elif name == 'launchbox':
@@ -664,7 +853,7 @@ class App:
         elif name == 'gametdb':
             self.provider_var.set('GameTDB · No account needed. Verified Wii and GameCube front covers.')
         elif name in ('thegamesdb', 'igdb', 'mobygames'):
-            self.provider_var.set(f'{SOURCE_NAMES[name]} · Credentials configured; service access is verified when scraping starts.'
+            self.provider_var.set(f'{SOURCE_NAMES[name]} · Credentials configured, unverified; actual service requests verify access.'
                                   if self._source_ready(name) else f'{SOURCE_NAMES[name]} · Unconfigured. Add your authorized API credentials in Settings.')
         else:
             chain = ['Libretro', 'LaunchBox', 'GameTDB'] + configured
@@ -847,6 +1036,8 @@ class App:
                 LOG.warning('%s failed (%s)', kind, type(exc).__name__)
                 message = (str(exc) if kind in ('scan', 'detect') else
                            'Could not export results. Choose a writable destination and try again.' if kind == 'export' else
+                           'Source check stopped.' if kind == 'sources-check' and isinstance(exc, Cancelled) else
+                           'Could not finish the source check. Review source details and try again.' if kind == 'sources-check' else
                            'Could not remember credentials. They still work for this session.' if kind == 'credentials-save' else
                            'Could not load saved credentials. Enter them in Settings for this session.' if kind == 'credentials-load' else
                            'Could not apply pending metadata. Check installation write permissions.')
@@ -892,6 +1083,8 @@ class App:
             page['offset'] = page['total'] = 0
             page['requested'] = page['applied'] = None
             page['tree'].delete(*page['tree'].get_children())
+            page['rows'] = {}
+            self._set_readonly_text(page['detail_text'], 'Select a game to inspect its result and source attempts.')
             page['label'].set('No games to show · 200 rows per page')
 
     def _begin_scan(self, folder: Path) -> None:
@@ -947,22 +1140,25 @@ class App:
             names = ['libretro', 'launchbox', 'gametdb']
             if auth.screen_scraper_app_credentials() and credentials['username'].strip() and credentials['password'].strip():
                 names.append('screenscraper')
-            if credentials['tgdb_api_key'].strip():
-                names.append('thegamesdb')
             if credentials['igdb_client_id'].strip() and credentials['igdb_client_secret'].strip():
                 names.append('igdb')
+            if credentials['tgdb_api_key'].strip():
+                names.append('thegamesdb')
             if credentials['mobygames_api_key'].strip():
                 names.append('mobygames')
             return FallbackProvider([make(name) for name in names], workers=self.settings.workers)
         if not self._source_ready(self.settings.provider):
             raise ValueError(f'{SOURCE_NAMES.get(self.settings.provider, self.settings.provider)} is unconfigured. Enter authorized credentials in Settings first.')
-        return make(self.settings.provider)
+        return FallbackProvider([make(self.settings.provider)], workers=self.settings.workers)
 
     def start(self) -> None:
         if self.busy or self._closing or not self.retrobat_root:
             return
         if 'credentials-load' in self._background_threads:
             self.status_var.set(CREDENTIALS_LOADING)
+            return
+        if 'sources-check' in self._background_threads:
+            self.status_var.set('Checking source access… Wait for the check to finish before starting.')
             return
         games = self.selection.games(self.games_by_system)
         if not games:
@@ -974,11 +1170,13 @@ class App:
         try:
             provider = self._make_provider()
             self._refresh_artwork_counts(force=True)
+            self._diagnostic_provider = None
             self.engine = ScrapeEngine(self.retrobat_root, provider,
                                        retry_passes=2 if self.settings.retry_failed else 0,
                                        keep_awake=self.settings.keep_awake)
             self._run_scope = self.selection_var.get() + ' · ' + self.scope_var.get()
             self.engine.start(games)
+            self._render_sources(force=True)
             self._invalidate_pages()
             self.notebook.select(self.downloads_tab)
             self._request_page('jobs', force=True)
@@ -1001,6 +1199,9 @@ class App:
     def stop(self) -> None:
         if self.engine and self.engine.active:
             self.engine.stop()
+        if 'sources-check' in self._background_threads:
+            self._diagnostic_cancel.set()
+            self.status_var.set('Stopping the source check…')
         if self._worker_kind in ('scan', 'detect'):
             self._cancel_scan.set()
             self.status_var.set('Stopping the scan…')
@@ -1032,6 +1233,34 @@ class App:
             self._export_destination = destination
             self.status_var.set('Exporting all artwork results…')
             self._run_background('export', lambda:State.export_report(root, destination), independent=True)
+
+    def check_sources(self) -> None:
+        if self.busy or self._closing or not self._provider_ready():
+            return
+        if not self._apply_settings():
+            self.show_settings()
+            return
+        try:
+            provider = self._make_provider()
+        except Exception as exc:
+            LOG.warning('Could not configure source check (%s)', type(exc).__name__)
+            self.status_var.set('Could not configure the source check. Review Settings and source access requirements.')
+            return
+        self._diagnostic_provider = provider
+        self._diagnostic_cancel.clear()
+        self.notebook.select(self.sources_tab)
+        self.status_var.set('Checking sources with actual service requests… Review statuses and request counts below.')
+        self._render_sources(force=True)
+        def checkpoint():
+            if self._diagnostic_cancel.is_set():
+                raise Cancelled()
+        def check():
+            try:
+                provider.check_sources(checkpoint)
+                return 'Source check finished. Review each source status and detail; cover availability is checked per game.'
+            finally:
+                provider.close()
+        self._run_background('sources-check', check, independent=True)
 
     def _persist(self) -> None:
         if self._smoke_test:
@@ -1108,6 +1337,9 @@ class App:
                 self.settings_status_var.set(error or result)
             elif kind == 'export':
                 self.status_var.set(error or f'Exported {result:,} artwork results to {self._export_destination}.')
+            elif kind == 'sources-check':
+                self.status_var.set(error or result)
+                self._render_sources(force=True)
             pending = self._background_pending.pop(kind, None)
             if pending is not None and (not self._closing or kind == 'credentials-save'):
                 self._run_background(kind, pending, independent=True)
@@ -1156,6 +1388,14 @@ class App:
         self._refresh_buttons()
 
     def _render_progress(self) -> None:
+        if (self._diagnostic_provider is not None and not (self.engine and self.engine.active)
+                and self._worker_kind not in ('scan', 'detect')):
+            checking = 'sources-check' in self._background_threads
+            stopped = self._diagnostic_cancel.is_set()
+            self.state_var.set('Checking' if checking else 'Stopped' if stopped else 'Finished')
+            self.progress.configure(maximum=1, value=0 if checking else 1)
+            self.progress_var.set('Checking source access' if checking else 'Source check stopped' if stopped else 'Check finished · review Sources')
+            return
         if not self.engine:
             return
         self._refresh_artwork_counts()
@@ -1180,7 +1420,7 @@ class App:
         self._previous_pending = p.pending
 
     def _maybe_apply_pending(self) -> None:
-        if self._smoke_test or self._closing or self.busy or not self.engine:
+        if self._smoke_test or self._closing or self.busy or not self.engine or 'sources-check' in self._background_threads:
             return
         if time.monotonic()-self._last_pending_check < 5:
             return
@@ -1290,6 +1530,7 @@ class App:
                 self._request_page(name, force=True)
             else:
                 selected = set(page['tree'].selection())
+                page['rows'] = {row.key:row for row in rows}
                 page['tree'].delete(*page['tree'].get_children())
                 for row in rows:
                     parts = [row.artwork if name == 'downloaded' else row.detail or row.artwork]
@@ -1301,6 +1542,7 @@ class App:
                 selected.intersection_update(page['tree'].get_children())
                 if selected:
                     page['tree'].selection_set(*selected)
+                self._job_selected(name)
                 page['applied'] = signature
                 first = offset+1 if total else 0
                 last = min(offset+len(rows), total)
@@ -1347,6 +1589,7 @@ class App:
                     self.progress_var.set(f'{done:,} / {total:,} consoles scanned')
                     self.status_var.set(f'Scanning {name} ({done}/{total} consoles)…' if total else name)
             self._render_progress()
+            self._render_sources()
             self._maybe_apply_pending()
             self._maybe_page_refresh()
             self._refresh_buttons()
@@ -1357,6 +1600,7 @@ class App:
             return
         self._persist()
         self._closing = True
+        self._diagnostic_cancel.set()
         self._cancel_scan.set()
         self._pending_pages.clear()
         self._background_pending = {kind:operation for kind, operation in self._background_pending.items()

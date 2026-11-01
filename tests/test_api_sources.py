@@ -9,6 +9,8 @@ import importlib
 import importlib.util
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -153,6 +155,210 @@ def test_tgdb_exhausted_allowance_stops_future_requests(api, transport, tmp_path
     with pytest.raises(QuotaError):
         provider.find(game(tmp_path), lambda: None)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('automatic', [False, True])
+def test_tgdb_quota_denial_preserves_paid_inflight_match_and_public_download(api, transport, tmp_path, monkeypatch, automatic):
+    from novacore_scraper.sources import FallbackProvider
+
+    routes, calls = transport
+    platform_data = tg_platforms()
+    platform_data['remaining_monthly_allowance'] = 1
+    routes['/v1/Platforms'] = 200, platform_data, {}
+    sent, release_response = threading.Event(), threading.Event()
+
+    def final_paid_search(request):
+        sent.set()
+        assert release_response.wait(5), 'The paid search was not released.'
+        data = tg_games()
+        data['remaining_monthly_allowance'] = 0
+        return 200, data, {}
+
+    routes['/v1.1/Games/ByGameName'] = final_paid_search
+    image = io.BytesIO()
+    Image.new('RGB', (2, 3), 'green').save(image, 'PNG')
+    routes['/images/original/boxart/front/92-1.jpg'] = 200, image.getvalue(), {}
+    provider = api.TheGamesDBProvider(tmp_path / 'cache', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    source = FallbackProvider([provider]) if automatic else provider
+    source.prepare(lambda: None)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        paid = pool.submit(source.find, game(tmp_path), lambda: None)
+        try:
+            assert sent.wait(5), 'The last permitted search was not sent.'
+            with pytest.raises(ProviderError) as error:
+                source.find(game(tmp_path, 'Another title'), lambda: None)
+            assert getattr(error.value, 'reason', '') == 'allowance_unconfirmed'
+        finally:
+            release_response.set()
+        artwork = paid.result(timeout=5)
+    assert artwork is not None and artwork.provider_game_id == '92'
+    destination = tmp_path / 'front.png'
+    source.download(artwork, destination, lambda: None)
+    with Image.open(destination) as decoded:
+        assert decoded.size == (2, 3)
+    with pytest.raises(ProviderError):
+        source.find(game(tmp_path, 'Third title'), lambda: None)
+    assert [urlsplit(request.url).path for request in calls] == [
+        '/v1/Platforms', '/v1.1/Games/ByGameName', '/images/original/boxart/front/92-1.jpg']
+
+
+def test_tgdb_authentication_latch_still_aborts_inflight_catalogue_response(api, transport, tmp_path, monkeypatch):
+    routes, _ = transport
+    routes['/v1/Platforms'] = 200, tg_platforms(), {}
+    sent, release_response = threading.Event(), threading.Event()
+
+    def concurrent_search(request):
+        if parse_qs(urlsplit(request.url).query)['name'] != ['Sonic the Hedgehog']:
+            return 401, {'error': 'Rejected fixture-secret'}, {}
+        sent.set()
+        assert release_response.wait(5), 'The older search was not released.'
+        return 200, tg_games(), {}
+
+    routes['/v1.1/Games/ByGameName'] = concurrent_search
+    provider = api.TheGamesDBProvider(tmp_path / 'cache', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    provider.prepare(lambda: None)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        older = pool.submit(provider.find, game(tmp_path), lambda: None)
+        try:
+            assert sent.wait(5), 'The older search was not sent.'
+            with pytest.raises(AuthenticationError):
+                provider.find(game(tmp_path, 'Another title'), lambda: None)
+        finally:
+            release_response.set()
+        with pytest.raises(AuthenticationError):
+            older.result(timeout=5)
+
+
+def test_tgdb_failed_connections_do_not_claim_confirmed_server_quota(api, transport, tmp_path, monkeypatch):
+    routes, calls = transport
+    payload = tg_platforms()
+    payload['remaining_monthly_allowance'] = 3
+    routes['/v1/Platforms'] = 200, payload, {}
+    provider = api.TheGamesDBProvider(tmp_path / 'cache', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    monkeypatch.setattr(provider, '_wait', lambda *args: None)
+    provider.prepare(lambda: None)
+
+    def cannot_connect(request):
+        raise requests.ConnectionError('fixture-secret connection refused before server contact')
+
+    routes['/v1.1/Games/ByGameName'] = cannot_connect
+    with pytest.raises(QuotaError) as error:
+        provider.find(game(tmp_path), lambda: None)
+    assert getattr(error.value, 'reason', '') == 'allowance_unconfirmed'
+    assert getattr(error.value, 'retryable', True) is False
+    assert 'local request budget' in str(error.value)
+    assert 'server allowance' in str(error.value) and '3' in str(error.value)
+    assert 'fixture-secret' not in str(error.value)
+    stats = provider.request_stats()
+    assert stats['remaining'] == 3 and stats['local_budget'] == 0
+    assert len(calls) == 4
+
+
+def test_tgdb_reported_zero_is_confirmed_quota_exhaustion(api, transport, tmp_path, monkeypatch):
+    routes, calls = transport
+    payload = tg_platforms()
+    payload['remaining_monthly_allowance'] = 0
+    routes['/v1/Platforms'] = 200, payload, {}
+    provider = api.TheGamesDBProvider(tmp_path / 'cache', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    with pytest.raises(QuotaError) as error:
+        provider.find(game(tmp_path), lambda: None)
+    assert getattr(error.value, 'reason', 'quota_exhausted') == 'quota_exhausted'
+    assert 'unconfirmed' not in str(error.value)
+    stats = provider.request_stats()
+    assert stats['remaining'] == 0 and stats['local_budget'] == 0
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('kind', ['tgdb', 'igdb'])
+def test_connection_check_bypasses_warm_catalog_cache_without_duplicate_requests(api, transport, tmp_path, monkeypatch, kind):
+    routes, calls = transport
+    cache = tmp_path / 'cache'
+    if kind == 'tgdb':
+        routes['/v1/Platforms'] = 200, tg_platforms(), {}
+        make = lambda: api.TheGamesDBProvider(cache, 'fixture-secret', interval=0)
+        expected = ['/v1/Platforms']
+    else:
+        configure_ig(routes)
+        make = lambda: api.IGDBProvider(cache, 'fixture-client', 'fixture-secret', interval=0)
+        expected = ['/oauth2/token', '/v4/platforms']
+    first = make()
+    monkeypatch.setattr(first, '_rate', lambda checkpoint: None)
+    first.prepare(lambda: None)
+    saved = {path.name: path.read_bytes() for path in cache.glob('*')}
+    calls.clear()
+    checked = make()
+    monkeypatch.setattr(checked, '_rate', lambda checkpoint: None)
+    assert checked.check_connection(lambda: None) == 'Authenticated API request succeeded.'
+    assert [urlsplit(request.url).path for request in calls] == expected
+    assert {path.name: path.read_bytes() for path in cache.glob('*')} == saved
+    assert all(b'fixture-secret' not in raw and b'fixture-token' not in raw for raw in saved.values())
+
+
+@pytest.mark.parametrize('kind', ['tgdb', 'igdb'])
+def test_connection_check_rejects_missing_credentials_before_network(api, transport, tmp_path, kind):
+    _, calls = transport
+    provider = api.TheGamesDBProvider(tmp_path, '') if kind == 'tgdb' else api.IGDBProvider(tmp_path, '', '')
+    with pytest.raises(AuthenticationError):
+        provider.check_connection(lambda: None)
+    assert calls == []
+
+
+@pytest.mark.parametrize('kind', ['tgdb', 'igdb'])
+def test_connection_check_auth_failure_is_sanitized_even_with_warm_catalog_cache(api, transport, tmp_path, monkeypatch, kind):
+    routes, calls = transport
+    cache = tmp_path / 'cache'
+    if kind == 'tgdb':
+        routes['/v1/Platforms'] = 200, tg_platforms(), {}
+        make = lambda: api.TheGamesDBProvider(cache, 'fixture-secret', interval=0)
+    else:
+        configure_ig(routes)
+        make = lambda: api.IGDBProvider(cache, 'fixture-client', 'fixture-secret', interval=0)
+    first = make()
+    monkeypatch.setattr(first, '_rate', lambda checkpoint: None)
+    first.prepare(lambda: None)
+    calls.clear()
+    endpoint = '/v1/Platforms' if kind == 'tgdb' else '/oauth2/token'
+    routes[endpoint] = 401, {'error': 'fixture-secret fixture-token'}, {}
+    checked = make()
+    monkeypatch.setattr(checked, '_rate', lambda checkpoint: None)
+    with pytest.raises(AuthenticationError) as error:
+        checked.check_connection(lambda: None)
+    assert 'fixture-secret' not in str(error.value) and 'fixture-token' not in str(error.value)
+    assert len(calls) == 1
+
+
+def test_igdb_connection_check_refreshes_rejected_token_once_before_auth_failure(api, transport, tmp_path, monkeypatch):
+    routes, calls = transport
+    configure_ig(routes)
+    routes['/oauth2/token'] = [routes['/oauth2/token'],
+        (200, {'access_token': 'refreshed-token', 'expires_in': 3600, 'token_type': 'bearer'}, {})]
+    routes['/v4/platforms'] = 401, {'error': 'fixture-secret fixture-token refreshed-token'}, {}
+    provider = api.IGDBProvider(tmp_path, 'fixture-client', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    with pytest.raises(AuthenticationError) as error:
+        provider.check_connection(lambda: None)
+    assert all(secret not in str(error.value) for secret in ('fixture-secret', 'fixture-token', 'refreshed-token'))
+    assert [urlsplit(request.url).path for request in calls] == [
+        '/oauth2/token', '/v4/platforms', '/oauth2/token', '/v4/platforms']
+
+
+@pytest.mark.parametrize('kind', ['tgdb', 'igdb'])
+def test_connection_check_validates_platform_catalogue(api, transport, tmp_path, monkeypatch, kind):
+    routes, _ = transport
+    if kind == 'tgdb':
+        routes['/v1/Platforms'] = 200, tgdb({'platforms': {'bad': {'id': None, 'name': 'Invalid'}}}), {}
+        provider = api.TheGamesDBProvider(tmp_path, 'fixture-secret', interval=0)
+    else:
+        configure_ig(routes)
+        routes['/v4/platforms'] = 200, [{'id': None, 'name': 'Invalid'}], {}
+        provider = api.IGDBProvider(tmp_path, 'fixture-client', 'fixture-secret', interval=0)
+    monkeypatch.setattr(provider, '_rate', lambda checkpoint: None)
+    with pytest.raises(ProviderError, match='invalid platform'):
+        provider.check_connection(lambda: None)
 
 
 def test_igdb_oauth_form_post_scoped_query_cover_and_token_reuse(api, transport, tmp_path):

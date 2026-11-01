@@ -94,6 +94,7 @@ _DIAGNOSTICS = {
     'source': "TEXT NOT NULL DEFAULT ''", 'region': "TEXT NOT NULL DEFAULT ''",
     'match_note': "TEXT NOT NULL DEFAULT ''", 'attempts': 'INTEGER NOT NULL DEFAULT 0',
     'retryable': 'INTEGER NOT NULL DEFAULT 0',
+    'source_trace': "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -159,7 +160,7 @@ class State:
 
     def record(self, game: Game, status: str, artwork: Path | None = None,
                pending: bool = False, *, history: bool = False, reason=None, detail=None,
-               source=None, region=None, match_note=None, attempts=None, retryable=None):
+               source=None, region=None, match_note=None, attempts=None, retryable=None, source_trace=None):
         system_path = safe_path(self.root, game.system.path).relative_to(self.root).as_posix()
         if artwork is not None:
             artwork = Path(artwork).absolute()
@@ -174,6 +175,7 @@ class State:
                       artwork=art, pending=int(pending), title=game.title,
                       system_fullname=game.system.fullname, reason=reason, detail=detail,
                       source=source, region=region, match_note=match_note, attempts=attempts,
+                      source_trace=source_trace,
                       retryable=None if retryable is None else int(retryable))
         extra = ','.join(_DIAGNOSTICS)
         defaults = {name: ('0' if name in {'attempts', 'retryable'} else "''") for name in _DIAGNOSTICS}
@@ -322,7 +324,7 @@ class State:
         path = State._database(root)
         destination = State._report_destination(root, destination)
         fields = ['title', 'console', 'status', 'reason', 'detail', 'source', 'region',
-                  'match_note', 'artwork', 'attempts']
+                  'match_note', 'artwork', 'attempts', 'source_trace']
         temporary = None
         count = 0
         reader = (closing(sqlite3.connect(path.as_uri()+'?mode=ro', uri=True, timeout=10))

@@ -70,6 +70,7 @@ class JobSnapshot:
     match_note: str = ''
     attempts: int = 0
     retryable: bool = False
+    source_trace: str = ''
 
 
 _TERMINAL = frozenset({'completed', 'skipped', 'missing', 'failed', 'cancelled'})
@@ -342,11 +343,21 @@ class ScrapeEngine:
             close = getattr(matches, 'close', None)
             if callable(close):
                 close()
+            summary = getattr(self.provider, 'attempt_summary', None)
+            if callable(summary):
+                # Read worker-local evidence here, before the coordinator records
+                # the result on another thread. Never mix concurrent games.
+                trace = summary()
+                with self._condition:
+                    job = self._jobs[game.key]
+                    self._jobs[game.key] = replace(job, source_trace=trace)
+                    self._dirty_jobs.add(game.key)
+                    self._jobs_revision += 1
 
     def _diagnostics(self, job):
         return dict(reason=job.reason, detail=job.detail, source=job.source or None,
                     region=job.region or None, match_note=job.match_note or None,
-                    attempts=job.attempts, retryable=job.retryable)
+                    attempts=job.attempts, retryable=job.retryable, source_trace=job.source_trace)
 
     def _persist_dirty(self, state):
         with self._condition:
@@ -529,7 +540,8 @@ class ScrapeEngine:
                 if previous is not None:
                     job = self._jobs[game.key]
                     self._jobs[game.key] = replace(job, attempts=previous['attempts'],
-                        source=previous['source'], region=previous['region'], match_note=previous['match_note'])
+                        source=previous['source'], region=previous['region'], match_note=previous['match_note'],
+                        source_trace=previous.get('source_trace', ''))
                 cancelled = game.key in self._cancelled
             if cancelled:
                 if existing_artwork(game):

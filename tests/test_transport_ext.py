@@ -65,6 +65,23 @@ def test_missing_image_has_a_distinct_permanent_error(tmp_path, transport):
     assert isinstance(error.value, providers.ArtworkUnavailable)
 
 
+def test_http_attempt_counts_do_not_require_a_cover_or_count_denied_dispatch(tmp_path, transport):
+    calls, responses = transport
+    responses.append((404, b'not found', {}))
+    provider = PublicProvider(tmp_path, 'eu', 0, 1)
+    assert provider.request_stats()['requests'] == 0
+    with pytest.raises(providers.ArtworkUnavailable):
+        provider._request('https://source.invalid/no-cover.png', lambda: None)
+    assert len(calls) == provider.request_stats()['requests'] == 1
+    assert provider.request_stats()['api_requests'] == 0
+    def denied():
+        raise providers.QuotaError('Local request budget is exhausted.')
+    provider._before_request = denied
+    with pytest.raises(providers.QuotaError):
+        provider._request('https://source.invalid/denied.png', lambda: None)
+    assert len(calls) == provider.request_stats()['requests'] == 1
+
+
 def test_missing_reasons_are_isolated_by_worker_thread(tmp_path):
     provider = PublicProvider(tmp_path, 'eu', 0, 1)
     provider._unmatched('ambiguous_title', 'Several game IDs match.')

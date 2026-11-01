@@ -94,6 +94,16 @@ See [ScreenScraper's API documentation](https://www.screenscraper.fr/webapi2.php
 
 The Downloads filters distinguish **Missing**, **Failed** and **Retry wait**. Details explain ambiguous names, unsupported platforms, unavailable covers, account/quota problems and temporary failures. **Export results** writes a durable CSV report with console, game, status, reason, source, actual region, match notes, attempts and saved artwork path. Export runs in the background, including during downloads. Choose a `.csv` report destination outside ROM, media, metadata and recovery folders; protected library files cannot be replaced by export.
 
+### See which sources are actually working
+
+The **Sources** tab shows the frozen order used by the current/last run, each source's last result, game checks, cover candidates, saved covers, outgoing HTTP/API attempts and its last reported allowance where available. These counts are independent: a title search that finds no eligible cover can spend API allowance while saving zero images. Cached lookups can check games with zero network requests. The last server allowance may lag requests still in flight; a conservative local budget being exhausted after network errors is labelled **Budget unconfirmed**, rather than claiming the server has confirmed zero allowance.
+
+Click **Check sources** while idle to check the current configuration in the background. TheGamesDB and IGDB perform authenticated platform API requests even when a catalogue is cached, so rejected credentials cannot appear verified merely because cached preparation succeeded. This check consumes API requests and can use allowance. Other adapters report catalogue preparation separately from authenticated verification. A configured value is not proof of working access. ScreenScraper remains visibly blocked without an authorized NovaCore application registration, even if personal username/password fields are filled.
+
+In **Downloads**, select a game and click **Show details** (or double-click) for its complete source trace. No-match, unsupported platform, rejected authentication, quota suspension and successful downloads remain distinct. The trace is retained in recovery/history and included as `source_trace` in CSV export. A partial source outage keeps an unresolved game **Failed**, since the unavailable source could not be searched, while healthy fallback sources continue.
+
+Each game's sources are tried in order until a cover saves; several games run concurrently. Automatic tries configured IGDB before TheGamesDB to preserve TheGamesDB's limited monthly allowance. After changing credentials, start a new run to use them. No credential values or request URLs are included in diagnostics.
+
 Existing artwork remains untouched. Starting the same consoles again checks completed files and works on remaining gaps. Missing means no acceptable cover was found under the selected policy; it is not proof that no cover exists anywhere. There is no manual game-identity picker in this version, and ambiguous records are reported rather than guessed.
 
 ## RetroBat can stay open

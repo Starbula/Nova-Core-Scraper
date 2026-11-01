@@ -63,13 +63,15 @@ class Cancelled(Exception):
 LIBRETRO_SYSTEMS = {
     'nes': 'Nintendo - Nintendo Entertainment System', 'famicom': 'Nintendo - Nintendo Entertainment System',
     'fds': 'Nintendo - Family Computer Disk System', 'snes': 'Nintendo - Super Nintendo Entertainment System',
-    'snesmsu1': 'Nintendo - Super Nintendo Entertainment System', 'satellaview': 'Nintendo - Satellaview',
+    'snesmsu1': 'Nintendo - Super Nintendo Entertainment System', 'snes-msu1': 'Nintendo - Super Nintendo Entertainment System',
+    'satellaview': 'Nintendo - Satellaview',
     'sufami': 'Nintendo - Sufami Turbo', 'n64': 'Nintendo - Nintendo 64', 'n64dd': 'Nintendo - Nintendo 64DD',
     'gb': 'Nintendo - Game Boy', 'gbc': 'Nintendo - Game Boy Color', 'gba': 'Nintendo - Game Boy Advance',
     'nds': 'Nintendo - Nintendo DS', '3ds': 'Nintendo - Nintendo 3DS', 'n3ds': 'Nintendo - Nintendo 3DS',
     'gamecube': 'Nintendo - GameCube', 'wii': 'Nintendo - Wii', 'wiiu': 'Nintendo - Wii U',
     'virtualboy': 'Nintendo - Virtual Boy', 'pokemini': 'Nintendo - Pokemon Mini',
     'megadrive': 'Sega - Mega Drive - Genesis', 'genesis': 'Sega - Mega Drive - Genesis',
+    'megadrive-msu': 'Sega - Mega Drive - Genesis',
     'mastersystem': 'Sega - Master System - Mark III', 'gamegear': 'Sega - Game Gear',
     'sega32x': 'Sega - 32X', '32x': 'Sega - 32X', 'segacd': 'Sega - Mega-CD - Sega CD',
     'megacd': 'Sega - Mega-CD - Sega CD', 'saturn': 'Sega - Saturn', 'dreamcast': 'Sega - Dreamcast',
@@ -85,14 +87,18 @@ LIBRETRO_SYSTEMS = {
     'neogeo': 'SNK - Neo Geo', 'neogeocd': 'SNK - Neo Geo CD',
     'ngp': 'SNK - Neo Geo Pocket', 'ngpc': 'SNK - Neo Geo Pocket Color',
     'wonderswan': 'Bandai - WonderSwan', 'wonderswancolor': 'Bandai - WonderSwan Color',
+    'wswan': 'Bandai - WonderSwan', 'wswanc': 'Bandai - WonderSwan Color',
     'colecovision': 'Coleco - ColecoVision', 'intellivision': 'Mattel - Intellivision',
     'odyssey2': 'Magnavox - Odyssey2', 'vectrex': 'GCE - Vectrex', '3do': 'The 3DO Company - 3DO',
     'amstradcpc': 'Amstrad - CPC', 'gx4000': 'Amstrad - GX4000', 'c64': 'Commodore - 64',
     'amiga500': 'Commodore - Amiga', 'amiga1200': 'Commodore - Amiga', 'amiga': 'Commodore - Amiga',
+    'amiga4000': 'Commodore - Amiga',
     'amigacd32': 'Commodore - CD32', 'amigacdtv': 'Commodore - CDTV',
     'msx1': 'Microsoft - MSX', 'msx': 'Microsoft - MSX', 'msx2': 'Microsoft - MSX2',
     'zxspectrum': 'Sinclair - ZX Spectrum', 'zx81': 'Sinclair - ZX 81', 'x68000': 'Sharp - X68000',
     'x1': 'Sharp - X1', 'mame': 'MAME', 'arcade': 'MAME', 'fbneo': 'FBNeo - Arcade Games',
+    'cps1': 'MAME', 'cps2': 'MAME', 'cps3': 'MAME', 'cave': 'MAME',
+    'segastv': 'MAME', 'model2': 'MAME', 'model3': 'MAME',
     'atomiswave': 'Atomiswave', 'scummvm': 'ScummVM', 'dos': 'DOS', 'supervision': 'Watara - Supervision',
 }
 
@@ -158,6 +164,23 @@ class _Provider:
         self._image_locks: dict[bytes, tuple[threading.Lock, int]] = {}
         self._image_cache: OrderedDict[bytes, bytes] = OrderedDict()
         self._image_cache_bytes = 0
+        self._request_stats_lock = threading.Lock()
+        self._request_count = 0
+        self._api_request_count = 0
+
+    def request_stats(self) -> dict:
+        """Count actual outgoing attempts, not cached lookups or queued work."""
+        with self._request_stats_lock:
+            return dict(requests=self._request_count, api_requests=self._api_request_count, remaining=None)
+
+    def _note_request(self, url: str) -> None:
+        # Classify only the host; credentials and URLs never enter statistics.
+        host = (urlsplit(url).hostname or '').casefold()
+        api = host in {'api.thegamesdb.net', 'api.igdb.com', 'api.mobygames.com',
+                       'api.screenscraper.fr', 'www.screenscraper.fr', 'screenscraper.fr'}
+        with self._request_stats_lock:
+            self._request_count += 1
+            self._api_request_count += int(api)
 
     def prepare(self, checkpoint: Checkpoint) -> None:
         checkpoint()
@@ -287,6 +310,7 @@ class _Provider:
                         # rate/quota only when the prepared request is ready to send.
                         self._rate(checkpoint)
                         self._before_request()
+                        self._note_request(prepared.url)
                         response = session.send(prepared, timeout=(5, 20), allow_redirects=False, **settings)
                     except requests.RequestException:
                         if attempt == 3:

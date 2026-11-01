@@ -108,7 +108,7 @@ class WorkflowTests(unittest.TestCase):
         history,count=self.app.engine.downloaded_page()
         self.assertEqual(count,3)
         self.assertTrue(all(Path(row.artwork).is_file() for row in history))
-        self.assertEqual(len(self.app.notebook.tabs()),4)
+        self.assertEqual(len(self.app.notebook.tabs()),5)
         for name in ('nes','psp'):
             self.assertFalse((self.root/'roms'/name/'images'/'novacore').exists())
 
@@ -199,6 +199,55 @@ class WorkflowTests(unittest.TestCase):
         self.pump(lambda: not self.app.engine.active)
         self.assertEqual((self.app.engine.snapshot().skipped, self.app.engine.snapshot().completed), (3, 0))
         self.assertEqual((len(first.games), len(second.games)), (3, 2))
+
+    def test_configured_run_shows_igdb_checks_and_tgdb_quota_without_losing_fallback(self):
+        from novacore_scraper.providers import QuotaError
+        class Layer(FixtureProvider):
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+            def find(self, game, checkpoint):
+                checkpoint()
+                self.games.append(game)
+                if self.name == 'TheGamesDB':
+                    raise QuotaError('TheGamesDB monthly API allowance exhausted.')
+                if self.name == 'IGDB' and game.title != 'Game 0' or self.name == 'MobyGames':
+                    return Artwork('https://example.invalid/cover.png', self.name)
+                return None
+            def close(self):
+                pass
+        names = ('Libretro', 'LaunchBox', 'GameTDB', 'ScreenScraper', 'IGDB', 'TheGamesDB', 'MobyGames')
+        layers = {name:Layer(name) for name in names}
+        for key, variable in self.app._credential_vars.items():
+            variable.set('fixture-' + key)
+        self.app.select_console('gba')
+        with patch.object(ui.auth, 'screen_scraper_app_credentials', return_value=('approved-id', 'approved-secret')), \
+             patch.object(ui, 'LibretroProvider', return_value=layers['Libretro']), \
+             patch.object(ui, 'LaunchBoxProvider', return_value=layers['LaunchBox']), \
+             patch.object(ui, 'GameTDBProvider', return_value=layers['GameTDB']), \
+             patch.object(ui, 'ScreenScraperProvider', return_value=layers['ScreenScraper']), \
+             patch.object(ui, 'IGDBProvider', return_value=layers['IGDB']), \
+             patch.object(ui, 'TheGamesDBProvider', return_value=layers['TheGamesDB']), \
+             patch.object(ui, 'MobyGamesProvider', return_value=layers['MobyGames']):
+            self.app.start()
+        self.pump(lambda:self.app.engine is not None and not self.app.engine.active)
+        self.app._render_sources(force=True)
+        self.assertEqual([source.name for source in self.app.engine.provider.providers], list(names))
+        self.assertEqual(self.app.engine.snapshot().completed, 3)
+        self.assertEqual(self.app.engine.snapshot().failed, 0)
+        self.assertEqual(self.app.sources_tree.set('thegamesdb', 'state'), 'Quota exhausted')
+        self.assertEqual(int(self.app.sources_tree.set('igdb', 'lookups')), 3)
+        self.assertEqual(int(self.app.sources_tree.set('igdb', 'downloads')), 2)
+        self.assertIn('IGDB → TheGamesDB', self.app.source_chain_var.get())
+        rows, _ = self.app.engine.jobs_page()
+        game = next(row for row in rows if row.title == 'Game 0')
+        self.app._request_page('jobs', force=True)
+        self.pump(lambda:self.app.jobs_tree.exists(game.key))
+        self.app.jobs_tree.selection_set(game.key)
+        self.app._show_job_details('jobs')
+        detail = self.app._pages['jobs']['detail_text'].get('1.0', 'end')
+        for source in names:
+            self.assertIn(source, detail)
 
     def test_unattended_seven_source_run_preserves_scope_reports_and_match_notes(self):
         names = ('Libretro', 'LaunchBox', 'GameTDB', 'TheGamesDB', 'IGDB', 'MobyGames', 'ScreenScraper')
