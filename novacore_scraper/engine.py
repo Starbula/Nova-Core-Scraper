@@ -79,6 +79,9 @@ class ScrapeEngine:
         self._progress = Progress()
         self._jobs: dict[str, JobSnapshot] = {}
         self._search: dict[str, str] = {}
+        self._job_systems: dict[str, str] = {}
+        self._covered_jobs: set[str] = set()
+        self._artwork_counts: dict[str, int] = {}
         self._needed: set[str] = set()
         self._cancelled: set[str] = set()
         self._jobs_revision = 0
@@ -95,6 +98,18 @@ class ScrapeEngine:
     def jobs_revision(self) -> int:
         with self._condition:
             return self._jobs_revision
+
+    def artwork_counts(self) -> dict[str, int]:
+        """Covered games in this run, by console; no filesystem work on Tk's thread."""
+        with self._condition:
+            return dict(self._artwork_counts)
+
+    def _cover_game(self, key: str) -> None:
+        with self._condition:
+            if key not in self._covered_jobs:
+                self._covered_jobs.add(key)
+                system = self._job_systems[key]
+                self._artwork_counts[system] = self._artwork_counts.get(system, 0)+1
 
     def jobs_page(self, query='', statuses=None, offset=0, limit=200) -> tuple[list[JobSnapshot], int]:
         """Read the submitted queue without filesystem I/O or copying the full queue."""
@@ -163,7 +178,10 @@ class ScrapeEngine:
                 counts['resolved'] = self._progress.resolved + 1
             counts[status] = getattr(self._progress, status) + 1
             self._progress = replace(self._progress, **counts)
-            self._jobs[key] = replace(job, status=status, artwork=str(artwork or ''), detail=detail)
+            self._jobs[key] = replace(job, status=status, artwork=str(artwork or ''),
+                                      detail=detail or (job.detail if status == 'completed' else ''))
+            if artwork and status in {'completed', 'skipped'}:
+                self._cover_game(key)
             self._jobs_revision += 1
 
     def start(self, games):
@@ -176,7 +194,10 @@ class ScrapeEngine:
             self._stop = self._paused = False
             self._needed.clear()
             self._cancelled.clear()
+            self._covered_jobs.clear()
+            self._artwork_counts.clear()
             self._jobs = {game.key: JobSnapshot(game.key, game.title, game.system.fullname, 'checking') for game in games}
+            self._job_systems = {game.key: game.system.name for game in games}
             self._search = {game.key: _search_text(' '.join((game.title, game.system.fullname, game.key))) for game in games}
             self._jobs_revision += 1
             self._progress = Progress(total=len(games), state='Scraping', message='Checking existing artwork…')
@@ -232,22 +253,41 @@ class ScrapeEngine:
         checkpoint()
         self._transition(game.key, 'finding')
         self._update(message=f'{game.system.fullname}: {game.title}')
-        match = self.provider.find(game, checkpoint)
-        checkpoint()
-        if match is None:
-            return 'missing', None
-        destination = safe_path(game.system.path, artwork_destination(game))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint()
-        self._transition(game.key, 'downloading')
+        candidate_source = getattr(self.provider, 'candidates', None)
+        chained = callable(candidate_source)
+        if chained:
+            matches = iter(candidate_source(game, checkpoint))
+        else:
+            match = self.provider.find(game, checkpoint)
+            matches = iter(()) if match is None else iter((match,))
+        download_failed = False
         try:
-            self.provider.download(match, destination, checkpoint)
-        except FileExistsError:
-            # A completed deterministic file can be recovered without requesting it again.
-            if existing_artwork(game):
-                return 'skipped', destination
-            raise RuntimeError('An existing artwork destination is invalid; it was preserved. See log.')
-        return 'completed', destination
+            for match in matches:
+                checkpoint()
+                destination = safe_path(game.system.path, artwork_destination(game))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                self._transition(game.key, 'downloading', detail=f'Source: {match.source}')
+                try:
+                    self.provider.download(match, destination, checkpoint)
+                    return 'completed', destination
+                except FileExistsError:
+                    # Publication may have completed in a competing worker/tool.
+                    if existing_artwork(game):
+                        return 'skipped', destination
+                    raise RuntimeError('An existing artwork destination is invalid; it was preserved. See log.')
+                except ProviderError:
+                    if not chained:
+                        raise
+                    download_failed = True
+                    self._transition(game.key, 'finding', detail=f'{match.source} download failed; trying the next source.')
+                    LOG.warning('Artwork source download failed for %s (%s); trying fallback.', game.key, match.source)
+            if download_failed:
+                raise ProviderError('Matching artwork could not be downloaded from the available sources. Try again later.')
+            return 'missing', None
+        finally:
+            close = getattr(matches, 'close', None)
+            if callable(close):
+                close()
 
     def _record(self, state, game, result):
         field, art = result
@@ -303,11 +343,15 @@ class ScrapeEngine:
                 for game in games:
                     self.checkpoint()
                     with self._condition:
-                        if game.key in self._cancelled:
-                            # A cancelled entry is prepared without filesystem
-                            # work, so other jobs can leave the checking phase.
-                            self._count('checked')
-                            continue
+                        cancelled = game.key in self._cancelled
+                    if cancelled:
+                        # Cancellation stops provider work. Existing files still
+                        # contribute to actual library coverage, even when the
+                        # scan predates a previous download in this open app.
+                        if existing_artwork(game):
+                            self._cover_game(game.key)
+                        self._count('checked')
+                        continue
                     # Shared system directories / duplicate gamelist entries never cause duplicate downloads.
                     identity = str(game.path.absolute()).casefold()
                     if identity in seen:
@@ -329,6 +373,10 @@ class ScrapeEngine:
                             needed.append(game)
                 if needed:
                     try:
+                        report = getattr(self.provider, 'set_status_callback', None)
+                        if callable(report):
+                            report(lambda message: self._update(message=message))
+                        self._update(message='Preparing artwork sources; the first catalogue download may take a moment…')
                         self.provider.prepare(self.checkpoint)
                     except (Cancelled, ProviderError):
                         raise
@@ -336,7 +384,7 @@ class ScrapeEngine:
                         # Third-party exceptions may embed an authenticated URL.
                         raise RuntimeError('The artwork provider could not be prepared. Check connection and settings.') from None
                     self.checkpoint()
-                    workers = max(1, min(4, int(self.provider.workers)))
+                    workers = max(1, min(16, int(self.provider.workers)))
                     remaining = iter(needed)
                     exhausted = False
                     last_flush = time.monotonic()
@@ -401,6 +449,12 @@ class ScrapeEngine:
             fatal = str(exc) if isinstance(exc, (OSError, RuntimeError, ValueError)) else type(exc).__name__
             LOG.warning('Scraper stopped (%s)', type(exc).__name__)
         finally:
+            close = getattr(self.provider, 'close', None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    LOG.warning('Could not close artwork source (%s).', type(exc).__name__)
             # Preparation errors and stops also resolve work that was never
             # submitted to the bounded executor. Completed files stay intact.
             if fatal or self._stop:

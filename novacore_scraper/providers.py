@@ -16,6 +16,8 @@ import threading
 import time
 import unicodedata
 import warnings
+from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -30,6 +32,7 @@ from .models import Artwork, Game
 
 Checkpoint = Callable[[], None]
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_IMAGE_CACHE_BYTES = 64 * 1024 * 1024
 MAX_TEXT_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 CACHE_SECONDS = 7 * 24 * 3600
@@ -98,6 +101,7 @@ _REGION_ALIASES = {
     'kr': 'kr', 'korea': 'kr', 'cn': 'cn', 'china': 'cn', 'tw': 'tw', 'taiwan': 'tw', 'asia': 'asi', 'asi': 'asi',
 }
 _TAGS = re.compile(r'\(([^()]*)\)|\[([^\[\]]*)\]')
+_GOODTOOLS_REGIONS = {'u': 'us', 'e': 'eu', 'j': 'jp'}
 
 
 def _normal(value: str) -> str:
@@ -112,10 +116,14 @@ def _name_info(value: str) -> tuple[str, set[str], tuple[str, ...]]:
     regions: set[str] = set()
     qualifiers = []
     for match in _TAGS.finditer(value):
-        tag = _normal(match.group(1) or match.group(2))
+        tag = _normal(match.group(1) or match.group(2) or '')
+        if not tag or (match.group(2) is not None and tag == '!'):
+            continue
         parts = [part.strip() for part in re.split(r'[,/]', tag)]
         if parts and all(part in _REGION_ALIASES for part in parts):
             regions.update(_REGION_ALIASES[part] for part in parts)
+        elif (re.fullmatch(r'[uej]{1,3}', tag) and len(set(tag)) == len(tag)):
+            regions.update(_GOODTOOLS_REGIONS[letter] for letter in tag)
         elif re.fullmatch(r'[a-z]{2}(?:,[a-z]{2})*', tag) and all(part in {'en', 'fr', 'de', 'es', 'it', 'ja', 'pt', 'nl', 'sv', 'zh', 'ko'} for part in parts):
             continue
         else:
@@ -174,7 +182,7 @@ class _Provider:
     def __init__(self, cache_dir: Path, region: str, interval: float, workers: int):
         self.cache_dir = Path(cache_dir)
         self.region = _region(region)
-        self.workers = max(1, min(4, int(workers)))
+        self.workers = max(1, min(16, int(workers)))
         self.interval = max(0.0, float(interval)) if math.isfinite(float(interval)) else 1.0
         self._slots = threading.BoundedSemaphore(self.workers)
         self._rate_lock = threading.Lock()
@@ -186,6 +194,10 @@ class _Provider:
         self._sessions: list[requests.Session] = []
         self._sessions_lock = threading.Lock()
         self._fatal: tuple[type[ProviderError], str] | None = None
+        self._image_state_lock = threading.Lock()
+        self._image_locks: dict[bytes, tuple[threading.Lock, int]] = {}
+        self._image_cache: OrderedDict[bytes, bytes] = OrderedDict()
+        self._image_cache_bytes = 0
 
     def prepare(self, checkpoint: Checkpoint) -> None:
         checkpoint()
@@ -196,6 +208,9 @@ class _Provider:
             for session in self._sessions:
                 session.close()
             self._sessions.clear()
+        with self._image_state_lock:
+            self._image_cache.clear()
+            self._image_cache_bytes = 0
 
     def _session(self):
         if not hasattr(self._local, 'session'):
@@ -328,7 +343,7 @@ class _Provider:
                     continue
                 if status == 403:
                     response.close()
-                    self._stop(AuthenticationError, 'The provider rejected the credentials. Check both developer and user account details.')
+                    self._stop(AuthenticationError, 'The provider refused access. Check service availability and account access if required.')
                 if status in (430, 431):
                     response.close()
                     self._stop(QuotaError, 'The daily provider allowance is exhausted. Resume after it resets.')
@@ -374,13 +389,54 @@ class _Provider:
                 del response._novacore_slot
                 slot.release()
 
-    def download(self, artwork: Artwork, destination: Path, checkpoint: Checkpoint) -> None:
-        destination = Path(destination)
-        checkpoint()
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError('Artwork already exists at the destination.')
-        response = self._request(artwork.url, checkpoint)
-        raw = self._read(response, checkpoint, MAX_IMAGE_BYTES)
+    @contextmanager
+    def _image_guard(self, key: bytes, checkpoint: Checkpoint):
+        """Only identical URLs share a lock; waiters never consume HTTP slots."""
+        with self._image_state_lock:
+            lock, users = self._image_locks.get(key, (threading.Lock(), 0))
+            self._image_locks[key] = lock, users + 1
+        acquired = False
+        try:
+            while not lock.acquire(timeout=0.1):
+                checkpoint()
+                self._check_fatal()
+            acquired = True
+            checkpoint()
+            self._check_fatal()
+            yield
+        finally:
+            if acquired:
+                lock.release()
+            with self._image_state_lock:
+                _, users = self._image_locks[key]
+                if users == 1:
+                    del self._image_locks[key]
+                else:
+                    self._image_locks[key] = lock, users - 1
+
+    def _cached_image(self, key: bytes) -> bytes | None:
+        with self._image_state_lock:
+            raw = self._image_cache.get(key)
+            if raw is not None:
+                self._image_cache.move_to_end(key)
+            return raw
+
+    def _remember_image(self, key: bytes, raw: bytes) -> None:
+        # Only decoded/verified bytes reach here. Keep neither credentials nor
+        # raw artwork addresses in cache keys, and never persist image bytes.
+        if len(raw) > MAX_IMAGE_CACHE_BYTES:
+            return
+        with self._image_state_lock:
+            previous = self._image_cache.pop(key, None)
+            if previous is not None:
+                self._image_cache_bytes -= len(previous)
+            while self._image_cache and self._image_cache_bytes + len(raw) > MAX_IMAGE_CACHE_BYTES:
+                _, discarded = self._image_cache.popitem(last=False)
+                self._image_cache_bytes -= len(discarded)
+            self._image_cache[key] = raw
+            self._image_cache_bytes += len(raw)
+
+    def _decode_image(self, raw: bytes):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter('error', Image.DecompressionBombWarning)
@@ -394,10 +450,35 @@ class _Provider:
                     converted = picture.convert('RGBA' if 'A' in picture.getbands() or 'transparency' in picture.info else 'RGB')
         except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
             raise ProviderError('The provider returned an invalid or oversized image.') from None
+        return converted
+
+    def download(self, artwork: Artwork, destination: Path, checkpoint: Checkpoint) -> None:
+        destination = Path(destination)
         checkpoint()
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._check_fatal()
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError('Artwork already exists at the destination.')
+        self._trusted(artwork.url)
+        key = hashlib.sha256(artwork.url.encode('utf-8')).digest()
+        with self._image_guard(key, checkpoint):
+            # Another worker may have published this output while we waited.
+            if destination.exists() or destination.is_symlink():
+                raise FileExistsError('Artwork already exists at the destination.')
+            raw = self._cached_image(key)
+            uncached = raw is None
+            if uncached:
+                response = self._request(artwork.url, checkpoint)
+                raw = self._read(response, checkpoint, MAX_IMAGE_BYTES)
+            converted = self._decode_image(raw)
+            if uncached:
+                self._remember_image(key, raw)
         temporary = None
         try:
+            checkpoint()
+            self._check_fatal()
+            if destination.exists() or destination.is_symlink():
+                raise FileExistsError('Artwork already exists at the destination.')
+            destination.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(prefix='.novacore-', suffix='.tmp', dir=destination.parent, delete=False) as handle:
                 temporary = Path(handle.name)
                 converted.save(handle, format='PNG')
@@ -422,7 +503,9 @@ class _Provider:
 class LibretroProvider(_Provider):
     """Public, filename-based Named_Boxarts; no account or API key needed."""
     def __init__(self, cache_dir: Path, region: str = 'eu', interval: float = 1.0, workers: int = 2):
-        super().__init__(cache_dir, region, interval, workers)
+        super().__init__(cache_dir, region, interval, min(8, int(workers)))
+        # NovaCore's conservative public traffic policy, not a published quota.
+        self.interval = max(0.25, self.interval)
         self._catalogs: dict[str, list[str]] = {}
         self._catalog_lock = threading.Lock()
         self._indexes: dict[str, tuple[dict[str, list[str]], dict[str, list[str]]]] = {}

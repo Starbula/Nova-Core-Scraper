@@ -12,6 +12,8 @@ from novacore_scraper import ui
 from novacore_scraper.models import Artwork
 from novacore_scraper.engine import ScrapeEngine
 from novacore_scraper.settings import Settings
+from novacore_scraper.providers import ProviderError
+from novacore_scraper.sources import FallbackProvider
 
 
 class FixtureProvider:
@@ -149,3 +151,48 @@ class WorkflowTests(unittest.TestCase):
         progress=self.app.engine.snapshot()
         self.assertEqual((progress.needed,progress.resolved,progress.cancelled,progress.completed),(3,3,1,2))
         self.assertEqual(self.app.engine.downloaded_page()[1],2)
+
+    def test_automatic_fallback_updates_open_library_counts_and_skips_repeat_downloads(self):
+        class Source(FixtureProvider):
+            def __init__(self, name):
+                super().__init__()
+                self.name = name
+                self.downloads = []
+            def find(self, game, checkpoint):
+                checkpoint()
+                self.games.append(game)
+                if self.name == 'Libretro' and game.title == 'Game 1':
+                    return None
+                return Artwork('https://example.invalid/cover.png', self.name)
+            def download(self, artwork, destination, checkpoint):
+                self.downloads.append(destination.name)
+                if self.name == 'Libretro' and destination.name.startswith('Game 2-'):
+                    raise ProviderError('A catalogue image was removed.')
+                super().download(artwork, destination, checkpoint)
+            def close(self):
+                pass
+        first, second = Source('Libretro'), Source('LaunchBox')
+        chain = FallbackProvider([first, second], workers=8)
+        self.app.select_console('gba')
+        with patch.object(self.app, '_make_provider', return_value=chain):
+            self.app.start()
+        self.pump(lambda: self.app.engine is not None and not self.app.engine.active)
+        self.pump(lambda: self.app._existing_counts.get('gba') == 3)
+        self.assertEqual(self.app.engine.snapshot().completed, 3)
+        self.assertEqual(self.app.engine.artwork_counts(), {'gba': 3})
+        self.assertEqual(len(first.games), 3)
+        self.assertEqual({game.title for game in second.games}, {'Game 1', 'Game 2'})
+        self.assertEqual(int(self.app.tree.set('gba', 'existing')), 3)
+        self.assertEqual(int(self.app.tree.set('gba', 'missing')), 0)
+        self.assertEqual(int(self.app.tree.set('nes', 'missing')), 7)
+        self.assertIn('0 missing', self.app.scope_var.get())
+        self.assertIn('0 need artwork', self.app.start_button.cget('text'))
+        self.assertEqual(self.app.engine.downloaded_page()[1], 3)
+        jobs, _ = self.app.engine.jobs_page()
+        self.assertEqual({job.title: job.detail for job in jobs}, {
+            'Game 0': 'Source: Libretro', 'Game 1': 'Source: LaunchBox', 'Game 2': 'Source: LaunchBox'})
+        with patch.object(self.app, '_make_provider', return_value=chain):
+            self.app.start()
+        self.pump(lambda: not self.app.engine.active)
+        self.assertEqual((self.app.engine.snapshot().skipped, self.app.engine.snapshot().completed), (3, 0))
+        self.assertEqual((len(first.games), len(second.games)), (3, 2))

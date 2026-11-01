@@ -9,6 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 from novacore_scraper.models import System, Game, Artwork
 from novacore_scraper.engine import ScrapeEngine
+from novacore_scraper.providers import ProviderError
 from novacore_scraper.state import State
 
 
@@ -49,6 +50,176 @@ class EngineTests(unittest.TestCase):
     def game(self, title):
         p=self.path/(title+'.nes'); p.write_bytes(b'ROM unchanged')
         return Game(self.system,p,p.name,title)
+
+    def test_source_candidates_fall_back_after_broken_download(self):
+        class Chain(FakeProvider):
+            def candidates(self, game, checkpoint):
+                checkpoint()
+                yield Artwork('https://example.invalid/broken.png', 'first source')
+                checkpoint()
+                yield Artwork('https://example.invalid/working.png', 'LaunchBox')
+            def find(self, *_args):
+                raise AssertionError('The candidate chain must be consumed directly.')
+            def download(self, artwork, destination, checkpoint):
+                self.calls.append(artwork.source)
+                if artwork.source == 'first source':
+                    raise ProviderError('The artwork is no longer available.')
+                super().download(artwork, destination, checkpoint)
+        provider = Chain()
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: False)
+        engine.start([self.game('fallback')])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual(provider.calls, ['first source', 'LaunchBox'])
+        self.assertEqual((engine.snapshot().completed, engine.snapshot().failed), (1, 0))
+        job = engine.jobs_page()[0][0]
+        self.assertTrue(Path(job.artwork).is_file())
+        self.assertIn('LaunchBox', job.detail)
+
+    def test_exhausted_broken_download_is_failed_rather_than_missing(self):
+        class Chain(FakeProvider):
+            def candidates(self, game, checkpoint):
+                yield Artwork('https://example.invalid/broken.png', 'first source')
+            def download(self, *_args):
+                raise ProviderError('The artwork is unavailable.')
+        engine = ScrapeEngine(self.root, Chain(), process_running=lambda: True)
+        engine.start([self.game('good')])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual((engine.snapshot().completed, engine.snapshot().missing, engine.snapshot().failed), (0, 0, 1))
+
+    def test_sources_all_unmatched_are_missing_without_failed_count(self):
+        class Chain(FakeProvider):
+            def candidates(self, game, checkpoint):
+                checkpoint()
+                return iter(())
+        engine = ScrapeEngine(self.root, Chain(), process_running=lambda: True)
+        engine.start([self.game('good')])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual((engine.snapshot().completed, engine.snapshot().missing, engine.snapshot().failed), (0, 1, 0))
+
+    def test_preparing_source_reports_progress_and_closes_after_run(self):
+        class ReportingProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.closed = False
+                self.prepare_release = threading.Event()
+            def set_status_callback(self, callback):
+                self.status_callback = callback
+            def prepare(self, checkpoint):
+                self.status_callback('LaunchBox: downloading catalogue 12 / 104 MiB')
+                self.entered.set()
+                while not self.prepare_release.wait(.01):
+                    checkpoint()
+            def close(self):
+                self.closed = True
+        provider = ReportingProvider()
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True)
+        engine.start([self.game('good')])
+        try:
+            self.assertTrue(provider.entered.wait(2))
+            self.assertIn('12 / 104 MiB', engine.snapshot().message)
+        finally:
+            provider.prepare_release.set()
+            engine.wait(5)
+        self.assertEqual(engine.snapshot().completed, 1)
+        self.assertTrue(provider.closed)
+
+    def test_engine_uses_eight_configured_workers_simultaneously(self):
+        provider = FakeProvider()
+        provider.workers = 8
+        provider.release.clear()
+        all_entered = threading.Event()
+        def find(game, checkpoint):
+            provider.calls.append(game.title)
+            if len(provider.calls) == 8:
+                all_entered.set()
+            while not provider.release.wait(.01):
+                checkpoint()
+            return Artwork('https://example.invalid/box.png', 'fixture')
+        provider.find = find
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True)
+        engine.start([self.game(str(index)) for index in range(8)])
+        try:
+            self.assertTrue(all_entered.wait(2), 'Eight jobs should enter the provider before any download completes.')
+        finally:
+            provider.release.set()
+            engine.wait(5)
+        self.assertEqual(engine.snapshot().completed, 8)
+
+    def test_live_artwork_counts_are_per_system_include_existing_and_reset_per_run(self):
+        from novacore_scraper.library import artwork_destination
+        existing = self.game('existing')
+        destination = artwork_destination(existing)
+        destination.parent.mkdir(parents=True)
+        Image.new('RGB', (2, 2), 'blue').save(destination)
+        games = [existing, self.game('new'), self.game('missing')]
+        gba_path = self.root/'roms'/'gba'
+        gba_path.mkdir()
+        gba_system = System('gba', 'Game Boy Advance', gba_path, frozenset({'.gba'}))
+        gba = Game(gba_system, gba_path/'other.gba', 'other.gba', 'other')
+        gba.path.write_bytes(b'ROM unchanged')
+        provider = FakeProvider()
+        provider.workers = 1
+        entered = threading.Event()
+        release = threading.Event()
+        original_find = provider.find
+        def find(game, checkpoint):
+            if game.system.name == 'gba':
+                entered.set()
+                while not release.wait(.01):
+                    checkpoint()
+            return original_find(game, checkpoint)
+        provider.find = find
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True)
+        engine.start(games+[gba])
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(engine.artwork_counts(), {'nes': 2})
+            copy = engine.artwork_counts()
+            copy.clear()
+            self.assertEqual(engine.artwork_counts(), {'nes': 2})
+        finally:
+            release.set()
+            engine.wait(5)
+        self.assertEqual(engine.artwork_counts(), {'nes': 2, 'gba': 1})
+        self.assertEqual((engine.snapshot().completed, engine.snapshot().missing), (2, 1))
+        engine.start(games)
+        self.assertTrue(engine.wait(5))
+        self.assertEqual(engine.artwork_counts(), {'nes': 2})
+
+    def test_cancelled_preflight_entry_keeps_existing_coverage_in_live_totals(self):
+        from novacore_scraper.library import artwork_destination, existing_artwork
+        missing, existing = self.game('new'), self.game('existing')
+        destination = artwork_destination(existing)
+        destination.parent.mkdir(parents=True)
+        Image.new('RGB', (2, 2), 'blue').save(destination)
+        # This Game still has existing_artwork=None, as after an earlier run in
+        # the open app. A cached scan field alone cannot establish coverage.
+        self.assertIsNone(existing.existing_artwork)
+        entered, release = threading.Event(), threading.Event()
+        def check(game):
+            if game.key == missing.key and not entered.is_set():
+                entered.set()
+                self.assertTrue(release.wait(3))
+            return existing_artwork(game)
+        provider = FakeProvider()
+        provider.workers = 1
+        provider.release.clear()
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True)
+        with patch('novacore_scraper.engine.existing_artwork', side_effect=check):
+            engine.start([missing, existing])
+            try:
+                self.assertTrue(entered.wait(2))
+                engine.cancel_jobs([existing.key])
+                release.set()
+                self.assertTrue(provider.entered.wait(2))
+                self.assertEqual(engine.artwork_counts(), {'nes': 1})
+            finally:
+                release.set()
+                provider.release.set()
+                engine.wait(5)
+        self.assertEqual(engine.artwork_counts(), {'nes': 2})
+        self.assertEqual((engine.snapshot().completed, engine.snapshot().cancelled), (1, 1))
+        self.assertEqual(provider.calls, ['new'])
     def test_download_missing_failure_and_rom_integrity(self):
         games=[self.game(x) for x in ('good','missing','failed')]
         engine=ScrapeEngine(self.root, FakeProvider(), process_running=lambda:False)

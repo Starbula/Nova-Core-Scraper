@@ -284,7 +284,7 @@ def test_shared_request_spacing_and_worker_clamp(provider_module, transport, tmp
     routes, calls = transport
     routes['/a.png'] = routes['/b.png'] = (200, png_bytes(), {})
     p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0.04, workers=99)
-    assert p.workers == 4
+    assert p.workers == 8
     failures = []
     def run(name):
         try:
@@ -295,7 +295,7 @@ def test_shared_request_spacing_and_worker_clamp(provider_module, transport, tmp
     for thread in threads: thread.start()
     for thread in threads: thread.join()
     assert not failures
-    assert calls[1][1] - calls[0][1] >= 0.035
+    assert calls[1][1] - calls[0][1] >= 0.23
 
 
 def test_streaming_bodies_share_provider_concurrency_limit(provider_module, transport, tmp_path, monkeypatch):
@@ -458,3 +458,322 @@ def test_libretro_display_title_does_not_erase_explicit_file_qualifiers(provider
     item = Game(item.system, item.path, item.relative_path, 'Sonic the Hedgehog (Europe)')
     p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
     assert p.find(item, lambda: None) is None
+
+
+def test_same_url_concurrent_downloads_share_one_validated_response(provider_module, transport, tmp_path):
+    """Removing coalescing or successful-image reuse repeats network transfers."""
+    from concurrent.futures import ThreadPoolExecutor
+    routes, calls = transport
+    started = threading.Event()
+    release = threading.Event()
+    barrier = threading.Barrier(8)
+    def response(request):
+        started.set()
+        assert release.wait(3)
+        return 200, png_bytes(), {}
+    routes['/shared.png'] = response
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0, workers=8)
+    artwork = Artwork('https://thumbnails.libretro.com/shared.png', 'Libretro')
+    def download(index):
+        barrier.wait(timeout=3)
+        p.download(artwork, tmp_path / f'cover-{index}.png', lambda: None)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(download, index) for index in range(8)]
+        try:
+            assert started.wait(3)
+        finally:
+            release.set()
+        for future in futures:
+            future.result(timeout=5)
+    p.download(artwork, tmp_path / 'another.png', lambda: None)
+    assert len(calls) == 1
+    for index in range(8):
+        with Image.open(tmp_path / f'cover-{index}.png') as image:
+            assert image.format == 'PNG' and image.size == (3, 4)
+    assert not (tmp_path / 'cache').exists(), 'image cache must remain in memory'
+
+
+def test_distinct_urls_fill_all_sixteen_shared_provider_slots(provider_module, transport, tmp_path):
+    """A global download lock or the old four-worker clamp stalls distinct URLs."""
+    from concurrent.futures import ThreadPoolExecutor
+    routes, calls = transport
+    class PublicProvider(provider_module._Provider):
+        def _trusted_host(self, host):
+            return host == 'thumbnails.libretro.com'
+    p = PublicProvider(tmp_path / 'cache', 'eu', 0, 99)
+    release = threading.Event()
+    all_entered = threading.Event()
+    lock = threading.Lock()
+    active = maximum = 0
+    def response(request):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 16:
+                all_entered.set()
+        try:
+            assert release.wait(4)
+            return 200, png_bytes(), {}
+        finally:
+            with lock:
+                active -= 1
+    for index in range(16):
+        routes[f'/{index}.png'] = response
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = [pool.submit(p.download, Artwork(f'https://thumbnails.libretro.com/{index}.png', 'Test'),
+            tmp_path / f'{index}.png', lambda: None) for index in range(16)]
+        try:
+            progressed = all_entered.wait(2)
+        finally:
+            release.set()
+        for future in futures:
+            future.result(timeout=5)
+    assert progressed, f'only {maximum} distinct requests progressed together'
+    assert maximum == 16
+    assert len(calls) == 16
+
+
+def test_image_cache_evicts_least_recently_used_bytes(provider_module, transport, tmp_path, monkeypatch):
+    """The byte budget must evict cold images while a cache hit refreshes recency."""
+    routes, calls = transport
+    raw = png_bytes()
+    monkeypatch.setattr(provider_module, 'MAX_IMAGE_CACHE_BYTES', len(raw) * 2, raising=False)
+    for name in ('a', 'b', 'c'):
+        routes[f'/{name}.png'] = 200, raw, {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    for index, name in enumerate(('a', 'b', 'a', 'c', 'b')):
+        p.download(Artwork(f'https://thumbnails.libretro.com/{name}.png', 'Libretro'),
+            tmp_path / f'{index}.png', lambda: None)
+    assert [urlsplit(url).path for url, _ in calls] == ['/a.png', '/b.png', '/c.png', '/b.png']
+
+
+def test_image_larger_than_cache_budget_is_valid_but_requested_again(provider_module, transport, tmp_path, monkeypatch):
+    routes, calls = transport
+    raw = png_bytes()
+    monkeypatch.setattr(provider_module, 'MAX_IMAGE_CACHE_BYTES', len(raw) - 1, raising=False)
+    routes['/large.png'] = 200, raw, {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    for index in range(2):
+        p.download(Artwork('https://thumbnails.libretro.com/large.png', 'Libretro'),
+            tmp_path / f'{index}.png', lambda: None)
+    assert len(calls) == 2
+    assert (tmp_path / '0.png').read_bytes() == (tmp_path / '1.png').read_bytes()
+
+
+def test_invalid_image_does_not_poison_shared_url_cache(provider_module, transport, tmp_path):
+    routes, calls = transport
+    routes['/cover.png'] = [(200, b'broken image', {}), (200, png_bytes(), {}), (200, png_bytes(), {})]
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    artwork = Artwork('https://thumbnails.libretro.com/cover.png', 'Libretro')
+    with pytest.raises(provider_module.ProviderError):
+        p.download(artwork, tmp_path / 'broken.png', lambda: None)
+    p.download(artwork, tmp_path / 'good.png', lambda: None)
+    p.download(artwork, tmp_path / 'cached.png', lambda: None)
+    assert len(calls) == 2
+    assert not (tmp_path / 'broken.png').exists()
+    assert (tmp_path / 'good.png').read_bytes() == (tmp_path / 'cached.png').read_bytes()
+
+
+def test_cancelled_same_url_waiter_does_not_request_or_block_owner(provider_module, transport, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    routes, calls = transport
+    started = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    waiter_seen = threading.Event()
+    def response(request):
+        started.set()
+        assert release.wait(3)
+        return 200, png_bytes(), {}
+    routes['/cover.png'] = response
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0, workers=2)
+    artwork = Artwork('https://thumbnails.libretro.com/cover.png', 'Libretro')
+    checkpoints = 0
+    def checkpoint():
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints >= 3:
+            waiter_seen.set()
+        if cancelled.is_set():
+            raise provider_module.Cancelled()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(p.download, artwork, tmp_path / 'owner.png', lambda: None)
+        try:
+            assert started.wait(2)
+            waiter = pool.submit(p.download, artwork, tmp_path / 'cancelled.png', checkpoint)
+            assert waiter_seen.wait(2)
+            cancelled.set()
+            with pytest.raises(provider_module.Cancelled):
+                waiter.result(timeout=0.5)
+            assert len(calls) == 1
+        finally:
+            release.set()
+        owner.result(timeout=3)
+    assert (tmp_path / 'owner.png').exists()
+    assert not (tmp_path / 'cancelled.png').exists()
+
+
+def test_destination_created_while_coalescing_is_preserved(provider_module, transport, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    routes, calls = transport
+    started = threading.Event()
+    release = threading.Event()
+    waiter_seen = threading.Event()
+    destination = tmp_path / 'racing.png'
+    def response(request):
+        started.set()
+        assert release.wait(3)
+        return 200, png_bytes(), {}
+    routes['/cover.png'] = response
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0, workers=2)
+    artwork = Artwork('https://thumbnails.libretro.com/cover.png', 'Libretro')
+    checkpoints = 0
+    def checkpoint():
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints >= 3:
+            waiter_seen.set()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(p.download, artwork, tmp_path / 'owner.png', lambda: None)
+        try:
+            assert started.wait(2)
+            waiter = pool.submit(p.download, artwork, destination, checkpoint)
+            assert waiter_seen.wait(2)
+            destination.write_bytes(b'other writer')
+        finally:
+            release.set()
+        owner.result(timeout=3)
+        with pytest.raises(FileExistsError):
+            waiter.result(timeout=3)
+    assert destination.read_bytes() == b'other writer'
+    assert len(calls) == 1
+    assert not list(tmp_path.glob('.novacore-*.tmp'))
+
+
+def test_cached_response_still_observes_destination_and_cancellation(provider_module, transport, tmp_path):
+    routes, calls = transport
+    routes['/cover.png'] = 200, png_bytes(), {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    artwork = Artwork('https://thumbnails.libretro.com/cover.png', 'Libretro')
+    destination = tmp_path / 'existing.png'
+    p.download(artwork, destination, lambda: None)
+    original = destination.read_bytes()
+    with pytest.raises(FileExistsError):
+        p.download(artwork, destination, lambda: None)
+    def cancel():
+        raise provider_module.Cancelled()
+    with pytest.raises(provider_module.Cancelled):
+        p.download(artwork, tmp_path / 'cancelled.png', cancel)
+    assert len(calls) == 1
+    assert destination.read_bytes() == original
+    assert not (tmp_path / 'cancelled.png').exists()
+
+
+def test_image_cache_budget_counts_bytes_across_unequal_images(provider_module, transport, tmp_path, monkeypatch):
+    """A larger validated response must evict enough bytes, not just one entry."""
+    routes, calls = transport
+    raw = png_bytes()
+    monkeypatch.setattr(provider_module, 'MAX_IMAGE_CACHE_BYTES', len(raw) * 3)
+    for name in ('a', 'b', 'c'):
+        routes[f'/{name}.png'] = 200, raw, {}
+    # A PNG may contain trailing data. The full verified response still counts
+    # against the raw-byte budget rather than its small decoded dimensions.
+    routes['/larger.png'] = 200, raw + b'\x00' * len(raw), {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    for index, name in enumerate(('a', 'b', 'c', 'larger', 'c', 'b')):
+        p.download(Artwork(f'https://thumbnails.libretro.com/{name}.png', 'Libretro'),
+            tmp_path / f'{index}.png', lambda: None)
+    assert [urlsplit(url).path for url, _ in calls] == [
+        '/a.png', '/b.png', '/c.png', '/larger.png', '/b.png']
+
+
+def test_screenscraper_account_threads_still_limit_distinct_downloads(provider_module, transport, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    routes, calls = transport
+    routes['/api2/ssuserInfos.php'] = 200, ss_user(maxthreads='2', maxrequestspermin='1000000000'), {}
+    routes['/api2/systemesListe.php'] = 200, {'response': {'systemes': []}}, {}
+    p = ss_provider(provider_module, tmp_path, workers=16)
+    p.prepare(lambda: None)
+    release = threading.Event()
+    two_entered = threading.Event()
+    lock = threading.Lock()
+    active = maximum = 0
+    def response(request):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                two_entered.set()
+        try:
+            assert release.wait(3)
+            return 200, png_bytes(), {}
+        finally:
+            with lock:
+                active -= 1
+    for index in range(4):
+        routes[f'/{index}.png'] = response
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(p.download, Artwork(f'https://api.screenscraper.fr/{index}.png', 'ScreenScraper'),
+            tmp_path / f'{index}.png', lambda: None) for index in range(4)]
+        try:
+            assert two_entered.wait(2)
+        finally:
+            release.set()
+        for future in futures:
+            future.result(timeout=4)
+    assert maximum == 2
+    assert len(calls) == 6  # Two account/catalog calls plus four images.
+
+
+@pytest.mark.parametrize('tag,expected_region', [('U', 'us'), ('E', 'eu'), ('J', 'jp'), ('UE', 'eu'), ('JUE', 'eu')])
+def test_libretro_recognizes_goodtools_region_and_good_dump_metadata(provider_module, transport, tmp_path, tag, expected_region):
+    routes, _ = transport
+    routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
+        '<a href="Sonic the Hedgehog (USA).png">US</a>'
+        '<a href="Sonic the Hedgehog (Europe).png">EU</a>'
+        '<a href="Sonic the Hedgehog (Japan).png">JP</a>', {})
+    p = provider_module.LibretroProvider(tmp_path / 'cache', region='eu', interval=0)
+    result = p.find(game(tmp_path, f'Sonic the Hedgehog ({tag}) [!]'), lambda: None)
+    assert result is not None
+    assert result.region == expected_region
+
+
+@pytest.mark.parametrize('qualifier', ['Hack', 'Disc 2', 'Rev 1', 'unknown metadata'])
+def test_goodtools_metadata_never_erases_content_qualifiers(provider_module, transport, tmp_path, qualifier):
+    routes, _ = transport
+    routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
+        '<a href="Sonic the Hedgehog (USA).png">US</a>', {})
+    p = provider_module.LibretroProvider(tmp_path / 'cache', region='eu', interval=0)
+    assert p.find(game(tmp_path, f'Sonic the Hedgehog (U) ({qualifier}) [!]'), lambda: None) is None
+
+
+def test_libretro_goodtools_combined_regions_do_not_allow_other_regions(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
+        '<a href="Sonic the Hedgehog (Japan).png">JP</a>', {})
+    p = provider_module.LibretroProvider(tmp_path / 'cache', region='jp', interval=0)
+    assert p.find(game(tmp_path, 'Sonic the Hedgehog (UE) [!]'), lambda: None) is None
+
+
+def test_libretro_ignores_empty_metadata_tags_in_real_catalogue_names(provider_module, transport, tmp_path):
+    routes, _ = transport
+    routes['/Sega%20-%20Mega%20Drive%20-%20Genesis/Named_Boxarts/'] = (200,
+        '<a href="Sonic the Hedgehog () [] (Europe).png">EU</a>', {})
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    result = p.find(game(tmp_path, 'Sonic the Hedgehog (Europe)'), lambda: None)
+    assert result is not None and result.region == 'eu'
+
+
+def test_public_source_access_refusal_avoids_developer_setup_instructions(provider_module, transport, tmp_path):
+    routes, calls = transport
+    routes['/cover.png'] = 403, b'remote error body', {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    for index in range(2):
+        with pytest.raises(provider_module.AuthenticationError) as error:
+            p.download(Artwork('https://thumbnails.libretro.com/cover.png', 'Libretro'),
+                tmp_path / f'{index}.png', lambda: None)
+        assert 'developer' not in str(error.value).lower()
+        assert 'remote error body' not in str(error.value)
+    assert len(calls) == 1

@@ -17,6 +17,8 @@ from .library import detect_installations
 from .scan import scan_library
 from .models import Game, System
 from .providers import LibretroProvider, ScreenScraperProvider
+from .launchbox import LaunchBoxProvider
+from .sources import FallbackProvider
 from .settings import Settings, data_directory, load_settings, save_settings
 
 LOG = logging.getLogger(__name__)
@@ -202,6 +204,7 @@ class App:
         self.engine: ScrapeEngine | None = None
         self.games_by_system: dict[str, list[Game]] = {}
         self._existing_counts: dict[str, int] = {}
+        self._last_artwork_check = 0.0
         self._selected_games = 0
         self._selected_existing = 0
         self._run_scope = ''
@@ -277,8 +280,8 @@ class App:
         provider_line.grid(row=1, column=0, sticky='ew', pady=(5, 10))
         provider_line.columnconfigure(0, weight=1)
         ttk.Label(provider_line, textvariable=self.provider_var, wraplength=850).grid(row=0, column=0, sticky='w')
-        self.use_libretro_button = ttk.Button(provider_line, text='Use Libretro', command=self.use_libretro)
-        self.use_libretro_button.grid(row=0, column=1, padx=(10, 0))
+        self.use_automatic_button = ttk.Button(provider_line, text='Use automatic sources', command=self.use_automatic)
+        self.use_automatic_button.grid(row=0, column=1, padx=(10, 0))
         self.notebook = ttk.Notebook(main)
         self.notebook.grid(row=2, column=0, sticky='nsew')
         self.library_tab = ttk.Frame(self.notebook, padding=12)
@@ -442,7 +445,7 @@ class App:
         tab.columnconfigure(1, weight=1)
         self._settings_controls = []
         fields = (
-            ('Artwork provider', self.provider_setting_var, ('libretro', 'screenscraper')),
+            ('Artwork provider', self.provider_setting_var, ('automatic', 'libretro', 'launchbox', 'screenscraper')),
             ('Preferred region', self.region_setting_var, ('eu', 'us', 'jp', 'wor', 'fr', 'de', 'uk', 'es', 'it', 'br', 'au')),
         )
         for row, (label, variable, values) in enumerate(fields):
@@ -463,13 +466,16 @@ class App:
         rate = ttk.Frame(tab)
         rate.grid(row=4, column=0, columnspan=2, sticky='w', pady=12)
         for column, (label, variable, minimum, maximum, increment) in enumerate((
-            ('Seconds between requests', self.interval_setting_var, .5, 60, .5),
-            ('Concurrent requests (1–4)', self.workers_setting_var, 1, 4, 1))):
+            ('Seconds between requests', self.interval_setting_var, .25, 60, .25),
+            ('Concurrent requests (1–16)', self.workers_setting_var, 1, 16, 1))):
             ttk.Label(rate, text=label).grid(row=0, column=column*2, padx=(0, 8))
             widget = ttk.Spinbox(rate, textvariable=variable, from_=minimum, to=maximum, increment=increment, width=8)
             widget.grid(row=0, column=column*2+1, padx=(0, 24))
             self._settings_controls.append((widget, 'normal'))
-        ttk.Label(tab, text='Provider account limits may reduce concurrency. Account passwords are never saved.').grid(row=5, column=0, columnspan=2, sticky='w')
+        self.fast_preset_button = ttk.Button(rate, text='Fast preset · 8 / 0.25 s', command=self.use_fast_preset)
+        self.fast_preset_button.grid(row=0, column=4)
+        self._settings_controls.append((self.fast_preset_button, 'normal'))
+        ttk.Label(tab, text='Per-provider request and account limits may reduce concurrency. Account passwords are never saved.').grid(row=5, column=0, columnspan=2, sticky='w')
         media = ttk.Frame(tab)
         media.grid(row=6, column=0, columnspan=2, sticky='w', pady=12)
         self._media_vars = [tk.BooleanVar(value=value) for value in (True, False, False, False)]
@@ -503,7 +509,7 @@ class App:
         account_enabled = available and self.provider_setting_var.get() == 'screenscraper'
         for widget in self._account_entries:
             widget.configure(state='normal' if account_enabled else 'disabled')
-        self.use_libretro_button.configure(state='normal' if available and self.provider_setting_var.get() != 'libretro' else 'disabled')
+        self.use_automatic_button.configure(state='normal' if available and self.provider_setting_var.get() != 'automatic' else 'disabled')
         active = bool(self.engine and self.engine.active)
         state = self.engine.snapshot().state if active else ''
         self.pause_button.configure(text='Resume' if state == 'Paused' else 'Pause', state='normal' if active and state != 'Stopping' and not self._closing else 'disabled')
@@ -519,16 +525,37 @@ class App:
         self._refresh_buttons()
 
     def _refresh_provider(self) -> None:
-        self.auth_status_var.set(auth.screen_scraper_status())
         if self.provider_setting_var.get() == 'screenscraper':
+            self.auth_status_var.set(auth.screen_scraper_status())
             if not auth.screen_scraper_app_credentials():
                 self.provider_var.set(auth.screen_scraper_status())
             elif not self.account_username_var.get().strip() or not self.account_password_var.get().strip():
                 self.provider_var.set('ScreenScraper: enter your username and password in Settings before starting.')
             else:
                 self.provider_var.set('ScreenScraper account configured · Service access is verified when scraping starts.')
-        else:
+        elif self.provider_setting_var.get() == 'libretro':
             self.provider_var.set('Libretro · Ready to download box artwork without an account.')
+        elif self.provider_setting_var.get() == 'launchbox':
+            self.provider_var.set('LaunchBox · No account needed. First use downloads a catalogue of about 110 MB; later runs use its cache.')
+        else:
+            self.provider_var.set('Automatic · Libretro → LaunchBox fallback, without an account. First LaunchBox use downloads a catalogue of about 110 MB; later runs use its cache.')
+        if self.provider_setting_var.get() != 'screenscraper':
+            self.auth_status_var.set(self.provider_var.get())
+
+    def use_automatic(self) -> None:
+        if self.busy or self._closing:
+            return
+        self.provider_setting_var.set('automatic')
+        self.settings = replace(self.settings, provider='automatic')
+        self._persist()
+        self.status_var.set('Automatic sources selected: Libretro, then LaunchBox. Choose a console and start scraping.')
+
+    def use_fast_preset(self) -> None:
+        if self.busy or self._closing:
+            return
+        self.interval_setting_var.set('0.25')
+        self.workers_setting_var.set('8')
+        self.settings_status_var.set('Fast preset selected: 8 workers / 0.25 seconds. Per-provider limits still apply. Save settings or start to use it.')
 
     def use_libretro(self) -> None:
         if self.busy or self._closing:
@@ -579,16 +606,42 @@ class App:
         if len(names) > 4:
             summary += f' · +{len(names)-4} more'
         self.selection_var.set(f'Selected consoles ({len(names)}): {summary}' if names else 'Selected consoles: none')
+        self._refresh_scope_counts()
+        self._refresh_buttons()
+
+    def _refresh_scope_counts(self) -> None:
+        selected_systems = [system for system in self.selection.systems if system.name in self.selection.selected]
         self._selected_games = sum(len(self.games_by_system.get(system.name, ())) for system in selected_systems)
-        for system in selected_systems:
-            if system.name not in self._existing_counts:
-                self._existing_counts[system.name] = sum(game.existing_artwork is not None
-                    for game in self.games_by_system.get(system.name, ()))
-        self._selected_existing = sum(self._existing_counts[system.name] for system in selected_systems)
+        self._selected_existing = sum(self._existing_counts.get(system.name,0) for system in selected_systems)
         missing = self._selected_games-self._selected_existing
         self.scope_var.set(f'{self._selected_games:,} games selected · {self._selected_existing:,} existing covers · {missing:,} missing covers')
         self.start_button.configure(text=f'Start scraping · {self._selected_games:,} games · {missing:,} need artwork')
-        self._refresh_buttons()
+
+    def _refresh_artwork_counts(self, *, force=False) -> None:
+        getter = getattr(self.engine, 'artwork_counts', None)
+        if not callable(getter):
+            return
+        now = time.monotonic()
+        if not force and now-self._last_artwork_check < .5:
+            return
+        self._last_artwork_check = now
+        changed = False
+        for name, covered in getter().items():
+            games = self.games_by_system.get(name)
+            if games is None:
+                continue
+            # A run reports only games it has checked so far. Keep the scan or
+            # previous run's baseline until that run catches up with it.
+            existing = max(self._existing_counts.get(name,0), min(len(games),covered))
+            if existing == self._existing_counts.get(name,0):
+                continue
+            self._existing_counts[name] = existing
+            changed = True
+            if self.tree.exists(name):
+                self.tree.set(name, 'existing', existing)
+                self.tree.set(name, 'missing', len(games)-existing)
+        if changed:
+            self._refresh_scope_counts()
 
     def select_console(self, name: str) -> None:
         if self.busy or self._closing:
@@ -728,6 +781,10 @@ class App:
             if not self.credentials['username'].strip() or not self.credentials['password'].strip():
                 raise ValueError('Enter your ScreenScraper username and password in Settings first.')
             return ScreenScraperProvider(cache, devid=application[0], devpassword=application[1], **self.credentials, **options)
+        if self.settings.provider == 'launchbox':
+            return LaunchBoxProvider(cache, **options)
+        if self.settings.provider == 'automatic':
+            return FallbackProvider([LibretroProvider(cache, **options), LaunchBoxProvider(cache, **options)], workers=self.settings.workers)
         return LibretroProvider(cache, **options)
 
     def start(self) -> None:
@@ -742,6 +799,7 @@ class App:
             return
         try:
             provider = self._make_provider()
+            self._refresh_artwork_counts(force=True)
             self.engine = ScrapeEngine(self.retrobat_root, provider)
             self._run_scope = self.selection_var.get() + ' · ' + self.scope_var.get()
             self.engine.start(games)
@@ -804,10 +862,10 @@ class App:
         try:
             interval = float(self.interval_setting_var.get())
             workers = int(self.workers_setting_var.get())
-            if not .5 <= interval <= 60 or not 1 <= workers <= 4:
+            if not .25 <= interval <= 60 or not 1 <= workers <= 16:
                 raise ValueError
         except ValueError:
-            self.settings_status_var.set('Use 0.5–60 seconds between requests and 1–4 concurrent requests.')
+            self.settings_status_var.set('Use 0.25–60 seconds between requests and 1–16 concurrent requests.')
             self.status_var.set(self.settings_status_var.get())
             return False
         self.settings = replace(self.settings, provider=self.provider_setting_var.get(), region=self.region_setting_var.get(), interval=interval, workers=workers)
@@ -867,6 +925,7 @@ class App:
     def _render_progress(self) -> None:
         if not self.engine:
             return
+        self._refresh_artwork_counts()
         p = self.engine.snapshot()
         checked = getattr(p, 'checked', 0)
         needed = getattr(p, 'needed', 0)

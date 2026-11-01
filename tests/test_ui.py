@@ -419,7 +419,7 @@ class TkTests(unittest.TestCase):
         self.assertIn('5 / 20 artwork jobs processed', self.app.progress_var.get())
         self.assertIn('Existing: 80', self.app.counts_var.get())
 
-    def test_unavailable_application_auth_blocks_start_and_offers_libretro(self):
+    def test_unavailable_application_auth_blocks_start_and_offers_automatic_sources(self):
         self.install_console_fixture()
         self.app.select_console('gba')
         with patch.object(ui.auth, 'screen_scraper_app_credentials', return_value=None):
@@ -430,10 +430,161 @@ class TkTests(unittest.TestCase):
             self.assertIn('unavailable', self.app.auth_status_var.get())
             self.assertIn('NovaCore', self.app.auth_status_var.get())
             self.assertEqual(len(self.app._account_entries), 2)
-            self.assertTrue(self.app.use_libretro_button.instate(['!disabled']))
-            self.app.use_libretro_button.invoke()
-        self.assertEqual(self.app.provider_setting_var.get(), 'libretro')
+            self.assertTrue(self.app.use_automatic_button.instate(['!disabled']))
+            self.app.use_automatic_button.invoke()
+        self.assertEqual(self.app.provider_setting_var.get(), 'automatic')
         self.assertTrue(self.app.start_button.instate(['!disabled']))
+
+    def test_settings_offer_sources_and_fast_preset_with_new_limits(self):
+        provider_widget = self.app._settings_controls[0][0]
+        self.assertEqual(tuple(provider_widget.cget('values')), ('automatic','libretro','launchbox','screenscraper'))
+        self.assertEqual(self.app.provider_setting_var.get(), 'automatic')
+        self.assertIn('Libretro', self.app.provider_var.get())
+        self.assertIn('LaunchBox', self.app.provider_var.get())
+        self.app.interval_setting_var.set('2')
+        self.app.workers_setting_var.set('3')
+        self.app.fast_preset_button.invoke()
+        self.assertTrue(self.app._apply_settings())
+        self.assertEqual((self.app.settings.workers,self.app.settings.interval),(8,.25))
+        self.app.workers_setting_var.set('16')
+        self.assertTrue(self.app._apply_settings())
+        self.app.workers_setting_var.set('17')
+        self.assertFalse(self.app._apply_settings())
+        self.app.workers_setting_var.set('8')
+        self.app.interval_setting_var.set('.24')
+        self.assertFalse(self.app._apply_settings())
+
+    def test_automatic_provider_uses_ordered_real_source_chain(self):
+        with patch.object(ui, 'data_directory', return_value=Path(self.temp.name)):
+            provider = self.app._make_provider()
+        self.addCleanup(provider.close)
+        self.assertIsInstance(provider, ui.FallbackProvider)
+        self.assertEqual([type(source) for source in provider.providers], [ui.LibretroProvider,ui.LaunchBoxProvider])
+        self.assertEqual(provider.workers,8)
+        self.app.settings = replace(self.app.settings,provider='launchbox')
+        with patch.object(ui, 'data_directory', return_value=Path(self.temp.name)):
+            standalone = self.app._make_provider()
+        self.addCleanup(standalone.close)
+        self.assertIsInstance(standalone,ui.LaunchBoxProvider)
+
+    def test_poll_updates_only_reported_console_covers_without_rescanning_games(self):
+        from types import SimpleNamespace
+        consoles = [system for system in gameboy_systems(Path(self.temp.name)) if system.name in ('nes','gba')]
+        self.app.retrobat_root = Path(self.temp.name)
+        self.app.selection.replace_systems(consoles)
+        self.app.games_by_system = {
+            system.name: [Game(system,system.path/f'{index}.rom',f'{index}.rom',f'Game {index}',
+                               system.path/'cover.png' if index == 0 else None) for index in range(4)]
+            for system in consoles
+        }
+        self.app._render_systems()
+        self.app.select_console('gba')
+        self.assertIn('3 missing covers',self.app.scope_var.get())
+
+        class NoGameScan(list):
+            def __iter__(self):
+                raise AssertionError('Live counts must not scan games on the Tk thread.')
+
+        self.app.games_by_system = {name:NoGameScan(games) for name,games in self.app.games_by_system.items()}
+        coverage = {'nes':3,'gba':0}  # GBA preflight has not checked its existing cover yet.
+        self.app.engine = SimpleNamespace(active=False,snapshot=lambda:Progress(completed=2,state='Finished'),
+                                         artwork_counts=lambda:dict(coverage))
+        self.app._poll()
+        self.assertEqual(tuple(map(int,self.app.tree.item('nes','values')[2:])),(3,1))
+        self.assertEqual(tuple(map(int,self.app.tree.item('gba','values')[2:])),(1,3))
+        self.assertIn('3 missing covers',self.app.scope_var.get())
+        coverage['gba'] = 3
+        self.pump_until(lambda:tuple(map(int,self.app.tree.item('gba','values')[2:])) == (3,1))
+        self.assertIn('3 existing covers · 1 missing covers',self.app.scope_var.get())
+        self.assertIn('1 need artwork',self.app.start_button.cget('text'))
+        self.assertEqual(self.app._existing_counts,{'nes':3,'gba':3})
+
+        # A new run reports partial preflight counts; retained totals cannot regress.
+        self.app.engine = SimpleNamespace(active=False,snapshot=lambda:Progress(pending=2),
+                                         artwork_counts=lambda:{'gba':0})
+        self.app._last_artwork_check = 0
+        self.app._poll()
+        self.assertEqual(tuple(map(int,self.app.tree.item('gba','values')[2:])),(3,1))
+        self.assertEqual(tuple(map(int,self.app.tree.item('nes','values')[2:])),(3,1))
+
+    def test_start_retains_latest_coverage_before_replacing_engine(self):
+        from types import SimpleNamespace
+        self.install_console_fixture()
+        self.app.select_console('gba')
+        self.app.engine = SimpleNamespace(active=False,snapshot=lambda:Progress(),artwork_counts=lambda:{'gba':1})
+        class NewEngine:
+            active = False
+            def __init__(self,*args):
+                pass
+            def start(self,games):
+                pass
+        with patch.object(ui,'ScrapeEngine',NewEngine), patch.object(self.app,'_make_provider',return_value=object()), \
+             patch.object(self.app,'_request_page'):
+            self.app.start()
+        self.assertEqual(self.app._existing_counts['gba'],1)
+        self.assertIn('0 need artwork',self.app.start_button.cget('text'))
+
+    def test_real_engine_covers_update_console_rows_while_metadata_is_pending(self):
+        from PIL import Image
+        from novacore_scraper.library import artwork_destination
+        from novacore_scraper.models import Artwork
+        root = Path(self.temp.name)
+        consoles = [system for system in gameboy_systems(root/'roms') if system.name in ('nes','gba')]
+        games = []
+        for system in consoles:
+            system.path.mkdir(parents=True)
+            for title in (('Existing','New') if system.name == 'nes' else ('New',)):
+                game = Game(system,system.path/f'{title}.rom',f'{title}.rom',title)
+                game.path.write_bytes(b'ROM unchanged')
+                if title == 'Existing':
+                    cover = artwork_destination(game)
+                    cover.parent.mkdir(parents=True)
+                    Image.new('RGB',(2,2),'blue').save(cover)
+                    game = replace(game,existing_artwork=cover)
+                games.append(game)
+        entered, release = threading.Event(), threading.Event()
+
+        class Provider:
+            workers = 1
+            def prepare(self,checkpoint):
+                checkpoint()
+            def find(self,game,checkpoint):
+                if game.system.name == 'gba':
+                    entered.set()
+                    while not release.wait(.01):
+                        checkpoint()
+                return Artwork('https://fixture.invalid/cover.png','fixture')
+            def download(self,artwork,destination,checkpoint):
+                checkpoint()
+                Image.new('RGB',(2,2),'red').save(destination)
+
+        engine = ui.ScrapeEngine(root,Provider(),process_running=lambda:True)
+        def finish_engine():
+            release.set()
+            engine.wait(5)
+        self.addCleanup(finish_engine)
+        self.app.retrobat_root = root
+        self.app.selection.replace_systems(consoles)
+        self.app.games_by_system = {system.name:[game for game in games if game.system == system] for system in consoles}
+        self.app._render_systems()
+        self.app.select_console('gba')
+        self.app.engine = engine
+        engine.start(games)
+        self.pump_until(entered.is_set)
+        self.pump_until(lambda:int(self.app.tree.set('nes','existing')) == 2)
+        self.assertEqual(int(self.app.tree.set('gba','existing')),0)
+        self.assertIn('1 missing covers',self.app.scope_var.get())
+        release.set()
+        self.pump_until(lambda:not engine.active and int(self.app.tree.set('gba','existing')) == 1)
+        self.assertEqual(engine.artwork_counts(),{'nes':2,'gba':1})
+        self.assertEqual(engine.snapshot().pending,3)
+        self.assertIn('1 existing covers · 0 missing covers',self.app.scope_var.get())
+        self.assertIn('0 need artwork',self.app.start_button.cget('text'))
+        engine.process_running = lambda:False
+        engine.apply_pending()
+        self.app._render_progress()
+        self.assertEqual(engine.snapshot().pending,0)
+        self.assertEqual(self.app._existing_counts,{'nes':2,'gba':1})
 
     def test_history_pages_load_off_tk_thread_and_render_at_most_200_rows(self):
         from types import SimpleNamespace

@@ -1,6 +1,6 @@
 # NovaCore Artwork Scraper
 
-A portable Windows 10/11 desktop tool for filling in missing RetroBat box artwork. Choose a RetroBat installation and the systems you want to scan, then start scraping. The default Libretro provider needs no account. The desktop interface and Settings use a readable dark theme.
+A portable Windows 10/11 desktop tool for filling in missing RetroBat box artwork. Choose a RetroBat installation and the systems you want to scan, then start scraping. The default **Automatic** mode tries Libretro and then LaunchBox, without an account. The desktop interface and Settings use a readable dark theme.
 
 Box artwork is the only supported media in this version. Manuals, ratings and pad-to-key are unavailable and disabled.
 
@@ -14,6 +14,8 @@ For source use, install Python 3.11 or newer with Tcl/Tk support, extract or clo
 2. Choose a console from the dropdown or click its name. This selects **only that console**. Use the large checkbox column for several consoles, or the global **Select All / Deselect All** buttons. Every new session starts with no consoles selected, so an old bulk selection cannot silently queue the whole library.
 3. Check the selected console names, game count and missing-cover count above the list, then click **Start scraping**. The app switches to **Downloads** and freezes that run's console scope.
 
+Console coverage totals, the selected-game summary and Start button update as covers finish. You do not need to close the application or rescan to see its downloads reflected. Artwork changes made by other programs still require **Scan library**.
+
 The optional console search matches partial words regardless of spaces: `GameBoy`, `Game Boy`, `Game Advance` and `GBA` can find Game Boy Advance. Choosing a console hidden by a search clears that search and scrolls its row into view.
 
 | Tab | Purpose |
@@ -21,17 +23,31 @@ The optional console search matches partial words regardless of spaces: `GameBoy
 | Library | Choose consoles and see games, existing covers and missing covers. |
 | Downloads | See each queued game's state, search/filter the queue, cancel selected games or cancel all, and pause/resume. |
 | Downloaded | Inspect completed artwork and its saved path, including downloads from earlier sessions. |
-| Settings | Choose the provider, region, request limits and optional ScreenScraper account in the same window. |
+| Settings | Choose automatic fallback or a single provider, region, request limits and optional ScreenScraper account in the same window. |
 
 Download tables show 200 rows per page, with Previous/Next controls, so large queues do not create tens of thousands of UI rows. Cancelling work keeps already completed artwork. The progress bar stays visible in every tab: first it shows selected-game checks, then missing-artwork jobs processed. Downloaded, existing, missing, failed and cancelled counts stay separate; 100% processed does not mean every game had a matching cover.
 
 The application reads the installation's system configuration where available and scans supported ROM files recursively. Scanning uses cached directory information, skips unrelated video/manual folders, and processes up to two consoles at a time. Autodetection stops as soon as it finds a valid installation. It honours existing artwork metadata and avoids linked directories. Ambiguous or unsupported library layouts may need manual artwork.
 
+### Faster scraping
+
+Settings provides a **Fast preset** of 8 workers and 0.25 seconds between request starts, with up to 16 configurable workers. Libretro uses at most 8 active requests and a 0.25-second minimum spacing; LaunchBox uses at least 0.5-second spacing. These are NovaCore's traffic limits, and server responses or ScreenScraper account permissions can slow requests further. More workers help overlap network waits and image processing; they cannot guarantee a particular download rate.
+
+Catalogue lookups happen locally after caching. Recent validated image bytes are reused within a run, with a bounded 64 MiB cache per source: simultaneous ROM entries using the same cover share a request while each receives its own safely published artwork file. Existing files continue to prevent repeat downloads across sessions.
+
+Older default settings migrate to automatic sources and the fast defaults. Saved custom rates and worker counts are retained within the supported bounds; explicit choices saved by this version are preserved.
+
 ## Providers and matching
+
+**Automatic** tries Libretro, then LaunchBox when no match is found or an image cannot be downloaded. A broken source does not prevent a healthy source from succeeding. If a source fails and no other source succeeds, the app reports a failure instead of pretending every source returned no match. Source information appears in the current Downloads row.
 
 **Libretro** uses the public [libretro-thumbnails collections](https://github.com/libretro-thumbnails/libretro-thumbnails) and `Named_Boxarts` images; see the [official thumbnail naming guide](https://docs.libretro.com/guides/roms-playlists-thumbnails/). Matching is deliberately conservative: a game title must match an available artwork title after the documented provider normalization. The app reports missing matches rather than selecting a similar title. A ROM filename, region label or custom game title that differs from the provider's naming may need a manual correction.
 
-**ScreenScraper** needs both a registered application integration and your personal account. Ordinary users enter only username and password in **Settings**. NovaCore does **not** ship an approved developer credential pair, so a personal login alone cannot currently enable this provider. Settings explains this upfront, and Start remains unavailable for an unconfigured ScreenScraper setup. Use the visible **Use Libretro** button to scrape without an account.
+**LaunchBox** uses its [official public metadata export](https://gamesdb.launchbox-app.com/Metadata.zip) and front-box images listed in that catalogue. Its administrator [permits other applications to use the data](https://forums.launchbox-app.com/topic/30050-tips-and-suggestions-for-games-database/) and [documents using exported image filenames](https://forums.launchbox-app.com/topic/54163-is-there-a-public-way-to-get-images-from-the-launchbox-games-database/). No LaunchBox installation or account is needed. On first use, NovaCore downloads a catalogue of about 110 MB and builds a compact SQLite index in the background; preparation messages show download/index progress. The index is cached for seven days. A failed refresh retains a previously usable index, and an interrupted first preparation can be retried. Keep roughly 300 MB free in the app's data drive for catalogue preparation, in addition to your artwork storage.
+
+LaunchBox matching requires one exact normalized title or verified alternate name within the correct platform, then selects an appropriate front cover using the ROM's region and your preference. Conflicting game IDs remain unmatched. GoodTools region abbreviations such as `(U)`, `(E)` and `(JUE)`, and verified-good `[!]` markers, are recognized. Hacks, discs, revisions and unknown qualifiers stay distinct. Extra sources improve coverage but do not guarantee artwork for every ROM variant, translation or homebrew title. The application does not redistribute LaunchBox's artwork or claim ownership of it.
+
+**ScreenScraper** needs both a registered application integration and your personal account. Ordinary users enter only username and password in **Settings**. NovaCore does **not** ship an approved developer credential pair, so a personal login alone cannot currently enable this provider. Settings explains this upfront, and Start remains unavailable for an unconfigured ScreenScraper setup. Use the visible **Use automatic sources** button to scrape without an account.
 
 For maintainers configuring an authorized NovaCore integration, the application pair is supplied through `NOVACORE_SS_DEVID` and `NOVACORE_SS_DEVPASSWORD`; account fields may be prefilled through `NOVACORE_SS_USERNAME` and `NOVACORE_SS_PASSWORD`. Local configuration is not proof of provider approval: ScreenScraper verifies the application and account on use. No other application's credentials are borrowed, and no credentials are saved in settings or logs. Account fields apply to the current session.
 
@@ -69,7 +85,7 @@ python -m venv .venv
 
 The headless self-test writes a JSON result containing a `success` boolean and returns a nonzero exit code on failure. The UI smoke test briefly opens and closes the desktop window and needs a graphical desktop. Neither option scans your real ROM library.
 
-Tests use temporary libraries, mocked process checks and local or fixture provider responses. They check library scanning, exact console scope, dropdown and row selection, flexible search, per-game cancellation, durable history, metadata preservation and provider behavior without proving live provider availability or account access. The Windows Actions workflow runs the fixture suite, opens a short UI smoke test, builds the executable, checks its headless self-test and uploads a portable ZIP. Check the workflow's actual result before relying on a build; a workflow definition alone is not evidence of a successful Windows run.
+Tests use temporary libraries, mocked process checks and local or fixture provider responses. They check library scanning, exact console scope, dropdown and row selection, flexible search, per-game cancellation, durable history, metadata preservation, live coverage totals, fallback failures, catalogue integrity and concurrent image reuse. Fixture tests do not prove live provider availability or account access. The Windows Actions workflow runs the fixture suite, opens a short UI smoke test, builds the executable, checks its headless self-test and uploads a portable ZIP. Check the workflow's actual result before relying on a build; a workflow definition alone is not evidence of a successful Windows run.
 
 ## License
 

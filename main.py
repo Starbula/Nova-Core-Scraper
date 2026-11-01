@@ -16,7 +16,10 @@ def self_test(output: Path) -> bool:
         from novacore_scraper.models import Artwork
         from novacore_scraper.library import validate_retrobat, discover_systems, scan_system
         from novacore_scraper.engine import ScrapeEngine
+        from novacore_scraper.launchbox import LaunchBoxProvider
+        from novacore_scraper.sources import FallbackProvider
         import xml.etree.ElementTree as ET
+        import zipfile
         class FixtureProvider:
             workers = 1
             def prepare(self, checkpoint):
@@ -42,6 +45,32 @@ def self_test(output: Path) -> bool:
             games = scan_system(nes)
             if len(games) != 1:
                 raise AssertionError('Fixture scan did not return one game')
+            # Exercise SAX/Expat and catalogue indexing inside the frozen app,
+            # where dynamically imported XML drivers could otherwise be absent.
+            cache = root/'catalogue-fixture'
+            cache.mkdir()
+            archive_path = cache/'metadata-fixture.zip'
+            with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('Metadata.xml', '''<LaunchBox>
+                    <Game><DatabaseID>1</DatabaseID><Name>Example</Name><Platform>Nintendo Entertainment System</Platform></Game>
+                    <GameImage><DatabaseID>1</DatabaseID><FileName>fixture.png</FileName><Type>Box - Front</Type><Region>Europe</Region></GameImage>
+                    </LaunchBox>''')
+            launchbox = LaunchBoxProvider(cache)
+            launchbox._index_archive(archive_path, launchbox._index, lambda: None)
+            class UnmatchedFixture(FixtureProvider):
+                name = 'Libretro'
+                def find(self, game, checkpoint):
+                    checkpoint()
+                    return None
+                def close(self):
+                    pass
+            chain = FallbackProvider([UnmatchedFixture(), launchbox])
+            try:
+                match = chain.find(games[0], lambda: None)
+                if match is None or match.source != 'LaunchBox' or match.region != 'eu':
+                    raise AssertionError('Fixture catalogue fallback failed')
+            finally:
+                chain.close()
             engine = ScrapeEngine(root, FixtureProvider(), process_running=lambda: True)
             engine.start(games)
             if not engine.wait(15) or engine.snapshot().completed != 1:
@@ -58,7 +87,8 @@ def self_test(output: Path) -> bool:
                 raise AssertionError('Repeated scrape did not skip existing artwork')
             if rom.read_bytes() != original:
                 raise AssertionError('Fixture ROM changed')
-            result.update(success=True, tests=['discovery', 'scan', 'fixture image', 'process deferral', 'metadata', 'repeat skip', 'ROM integrity'])
+            result.update(success=True, tests=['discovery', 'scan', 'fixture image', 'process deferral', 'metadata', 'repeat skip', 'ROM integrity',
+                                               'LaunchBox catalogue parser', 'automatic source fallback'])
     except Exception as exc:
         result['error'] = type(exc).__name__+': '+str(exc)
     output = output.absolute()

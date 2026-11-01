@@ -11,10 +11,10 @@ import tempfile
 @dataclass
 class Settings:
     retrobat_folder: str = ''
-    provider: str = 'libretro'
+    provider: str = 'automatic'
     region: str = 'eu'
-    workers: int = 2
-    interval: float = 1.0
+    workers: int = 8
+    interval: float = .25
     selected_systems: list[str] = field(default_factory=list)
 
 
@@ -39,12 +39,21 @@ def load_settings() -> Settings:
         selected=raw.get('selected_systems',[])
         if not isinstance(selected,list):
             selected=[]
+        provider=raw.get('provider','automatic')
+        workers=int(raw.get('workers',8))
+        interval=float(raw.get('interval',.25))
+        if raw.get('version',1) == 1 and provider == 'libretro':
+            provider='automatic'
+            if workers == 2:
+                workers=8
+            if interval == 1:
+                interval=.25
         return Settings(
             retrobat_folder=folder,
-            provider=raw.get('provider') if raw.get('provider') in ('libretro','screenscraper') else 'libretro',
+            provider=provider if provider in ('automatic','libretro','launchbox','screenscraper') else 'automatic',
             region=raw.get('region') if raw.get('region') in ('eu','us','jp','wor','fr','de','uk','es','it','br','au') else 'eu',
-            workers=max(1,min(4,int(raw.get('workers',2)))),
-            interval=max(.5,min(60,float(raw.get('interval',1)))),
+            workers=max(1,min(16,workers)),
+            interval=max(.25,min(60,interval)),
             selected_systems=[x for x in selected if isinstance(x,str)],
         )
     except (OSError,ValueError,TypeError,OverflowError):
@@ -55,6 +64,7 @@ def save_settings(settings: Settings):
     directory=data_directory()
     directory.mkdir(parents=True,exist_ok=True)
     raw=asdict(settings)
+    raw['version']=2
     if raw['retrobat_folder']:
         try:
             raw['retrobat_folder']=os.path.relpath(raw['retrobat_folder'],app_directory())
