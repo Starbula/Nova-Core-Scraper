@@ -16,6 +16,16 @@ def is_link(path: Path) -> bool:
         return False
 
 
+def _comparison_path(path: Path) -> Path:
+    """Compare equivalent Windows extended DOS/UNC paths with one anchor."""
+    drive = path.drive
+    if drive[:8].casefold() == '\\\\?\\unc\\':
+        return type(path)('\\\\' + str(path)[8:])
+    if drive.startswith('\\\\?\\') and len(drive) == 6 and drive.endswith(':'):
+        return type(path)(str(path)[4:])
+    return path
+
+
 def safe_path(root: Path, path: Path) -> Path:
     """Require lexical containment and reject links in every existing component."""
     root, path = root.absolute(), path.absolute()
@@ -25,7 +35,10 @@ def safe_path(root: Path, path: Path) -> Path:
     for p in (root, *(root.joinpath(*relative.parts[:i]) for i in range(1, len(relative.parts)+1))):
         if is_link(p):
             raise ValueError('Linked/reparse paths cannot be written.')
-    if not path.resolve().is_relative_to(root.resolve()):
+    # Concurrent parent creation can change Windows' missing-path error during
+    # resolve(), leaving a \\?\ prefix on only one result. Normalize comparison
+    # anchors only; preserve the original path for every filesystem operation.
+    if not _comparison_path(path.resolve()).is_relative_to(_comparison_path(root.resolve())):
         raise ValueError('Path escapes its library.')
     return path
 
