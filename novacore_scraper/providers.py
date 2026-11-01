@@ -308,10 +308,15 @@ class _Provider:
             for attempt in range(4):
                 while True:
                     self._trusted(current)
-                    self._rate(checkpoint)
-                    self._before_request()
                     try:
-                        response = self._session().get(current, params=params, timeout=(5, 20), stream=True, allow_redirects=False)
+                        session = self._session()
+                        prepared = session.prepare_request(requests.Request('GET', current, params=params))
+                        settings = session.merge_environment_settings(prepared.url, {}, True, None, None)
+                        # Preparation can block or finish out of order. Reserve
+                        # rate/quota only when the prepared request is ready to send.
+                        self._rate(checkpoint)
+                        self._before_request()
+                        response = session.send(prepared, timeout=(5, 20), allow_redirects=False, **settings)
                     except requests.RequestException:
                         if attempt == 3:
                             raise ProviderError('Network request failed after several attempts. Check your connection and try again.') from None

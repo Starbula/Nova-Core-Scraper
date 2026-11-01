@@ -777,3 +777,64 @@ def test_public_source_access_refusal_avoids_developer_setup_instructions(provid
         assert 'developer' not in str(error.value).lower()
         assert 'remote error body' not in str(error.value)
     assert len(calls) == 1
+
+
+def test_request_preparation_delay_cannot_bunch_dispatches(provider_module, transport, tmp_path, monkeypatch):
+    """Throttle dispatch after preparation, which may finish out of admission order."""
+    from concurrent.futures import ThreadPoolExecutor
+    routes, calls = transport
+    routes['/first.png'] = routes['/second.png'] = 200, png_bytes(), {}
+    first_preparing = threading.Event()
+    second_prepared = threading.Event()
+    original = requests.Session.prepare_request
+    def prepare(session, request):
+        if urlsplit(request.url).path == '/first.png':
+            first_preparing.set()
+            assert second_prepared.wait(2)
+        prepared = original(session, request)
+        if urlsplit(request.url).path == '/second.png':
+            second_prepared.set()
+        return prepared
+    monkeypatch.setattr(requests.Session, 'prepare_request', prepare)
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0, workers=2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(p.download, Artwork('https://thumbnails.libretro.com/first.png', 'Libretro'),
+            tmp_path / 'first.png', lambda: None)
+        assert first_preparing.wait(2)
+        second = pool.submit(p.download, Artwork('https://thumbnails.libretro.com/second.png', 'Libretro'),
+            tmp_path / 'second.png', lambda: None)
+        first.result(timeout=3)
+        second.result(timeout=3)
+    assert len(calls) == 2
+    assert calls[1][1] - calls[0][1] >= 0.23
+    assert (tmp_path / 'first.png').exists() and (tmp_path / 'second.png').exists()
+
+
+def test_prepared_dispatch_preserves_session_and_environment_settings(provider_module, transport, tmp_path, monkeypatch):
+    routes, calls = transport
+    routes['/cover.png'] = 200, png_bytes(), {}
+    p = provider_module.LibretroProvider(tmp_path / 'cache', interval=0)
+    session = p._session()
+    session.trust_env = False
+    session.headers['X-Fixture'] = 'session header'
+    session.cookies.set('member', 'fixture cookie')
+    session.params['session-param'] = 'retained'
+    session.proxies['https'] = 'http://proxy.invalid:8080'
+    session.verify = '/fixture-ca.pem'
+    session.cert = ('/fixture-cert.pem', '/fixture-key.pem')
+    original_send = requests.Session.send
+    observed = []
+    def send(active_session, prepared, **kwargs):
+        observed.append((prepared, kwargs))
+        return original_send(active_session, prepared, **kwargs)
+    monkeypatch.setattr(requests.Session, 'send', send)
+    response = p._request('https://thumbnails.libretro.com/cover.png', lambda: None, params={'request-param': 'retained'})
+    assert p._read(response, lambda: None, provider_module.MAX_IMAGE_BYTES) == png_bytes()
+    assert len(calls) == len(observed) == 1
+    prepared, kwargs = observed[0]
+    assert parse_qs(urlsplit(prepared.url).query) == {'session-param': ['retained'], 'request-param': ['retained']}
+    assert prepared.headers['X-Fixture'] == 'session header'
+    assert prepared.headers['Cookie'] == 'member=fixture cookie'
+    assert kwargs == {'timeout': (5, 20), 'allow_redirects': False, 'stream': True,
+        'verify': '/fixture-ca.pem', 'cert': ('/fixture-cert.pem', '/fixture-key.pem'),
+        'proxies': {'https': 'http://proxy.invalid:8080'}}
