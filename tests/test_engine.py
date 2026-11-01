@@ -121,3 +121,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.snapshot().skipped,1)
         self.assertEqual(provider.calls,[])
         self.assertTrue((self.path/'gamelist.xml').exists())
+
+    def test_literal_tilde_path_survives_scan_download_metadata_and_repeat(self):
+        from novacore_scraper.library import scan_system
+        import xml.etree.ElementTree as ET
+        folder = self.path/'~Homebrew'
+        folder.mkdir()
+        rom = folder/'~Example.nes'
+        rom.write_bytes(b'ROM unchanged')
+        games = scan_system(self.system)
+        self.assertEqual([g.relative_path for g in games], ['~Homebrew/~Example.nes'])
+        provider=FakeProvider()
+        engine=ScrapeEngine(self.root, provider, process_running=lambda:False)
+        engine.start(games); self.assertTrue(engine.wait(5))
+        self.assertEqual(engine.snapshot().state,'Finished',engine.snapshot().message)
+        self.assertEqual(engine.snapshot().completed,1)
+        self.assertEqual(engine.snapshot().pending,0)
+        tree = ET.parse(self.path/'gamelist.xml')
+        self.assertEqual(tree.findtext('game/path'),'./~Homebrew/~Example.nes')
+        engine.start(scan_system(self.system)); self.assertTrue(engine.wait(5))
+        self.assertEqual(engine.snapshot().skipped,1)
+        self.assertEqual(len(provider.calls),1)
+        self.assertEqual(rom.read_bytes(),b'ROM unchanged')

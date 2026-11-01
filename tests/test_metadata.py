@@ -83,6 +83,47 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual('./NESTED/my game.SFC', self.fields()['path'])
         self.assertEqual('./images/novacore/box.png', self.fields()['thumbnail'])
 
+    def test_plain_rom_update_does_not_touch_literal_spaced_rom_row(self):
+        plain = self.root / 'Game.nes'
+        spaced = self.root / ' Game.nes'
+        plain.write_bytes(b'plain ROM')
+        spaced.write_bytes(b'spaced ROM')
+        self.gamelist.write_text('<gameList><game><path> Game.nes</path>'
+                                 '<name>Spaced title</name></game><game><path>Game.nes</path>'
+                                 '<name>Plain title</name></game></gameList>')
+        self.updates = {'Game.nes': self.art}
+        self.assertEqual({'Game.nes'}, self.merge())
+        games = minidom.parse(str(self.gamelist)).getElementsByTagName('game')
+        self.assertEqual(2, len(games))
+        self.assertEqual(' Game.nes', _element_text(games[0].getElementsByTagName('path')[0]))
+        self.assertEqual([], games[0].getElementsByTagName('thumbnail'))
+        self.assertEqual([], games[0].getElementsByTagName('image'))
+        self.assertEqual('Spaced title', _element_text(games[0].getElementsByTagName('name')[0]))
+        self.assertEqual('./images/novacore/box.png',
+                         _element_text(games[1].getElementsByTagName('thumbnail')[0]))
+        self.assertEqual(b'spaced ROM', spaced.read_bytes())
+        self.assertEqual(b'plain ROM', plain.read_bytes())
+
+    def test_missing_spaced_rom_row_is_not_matched_to_plain_rom(self):
+        (self.root / 'Game.nes').write_bytes(b'ROM')
+        self.gamelist.write_text('<gameList><game><path> Game.nes</path>'
+                                 '<name>Missing spaced game</name></game></gameList>')
+        self.updates = {'Game.nes': self.art}
+        self.assertEqual({'Game.nes'}, self.merge())
+        games = minidom.parse(str(self.gamelist)).getElementsByTagName('game')
+        self.assertEqual(2, len(games))
+        self.assertEqual([], games[0].getElementsByTagName('thumbnail'))
+        self.assertEqual('./Game.nes', _element_text(games[1].getElementsByTagName('path')[0]))
+
+    def test_xml_path_formatting_is_normalized_without_duplicate_game(self):
+        self.gamelist.write_text('<gameList><game><path>\n \t ./nested/My Game.sfc \n</path>'
+                                 '<name>Formatted path</name></game></gameList>')
+        self.assertEqual(set(self.updates), self.merge())
+        document = minidom.parse(str(self.gamelist))
+        self.assertEqual(1, len(document.getElementsByTagName('game')))
+        self.assertEqual('Formatted path', self.fields()['name'])
+        self.assertEqual('./images/novacore/box.png', self.fields()['thumbnail'])
+
     def test_merge_preserves_comments_processing_instructions_folder_and_custom_fields(self):
         original = (b'<?xml version="1.0"?><?custom keep?>\n'
                     b'<!-- outside --><gameList custom="yes">\n'
@@ -138,6 +179,23 @@ class MetadataTests(unittest.TestCase):
         self.gamelist.write_bytes(original)
         self.assertEqual(set(self.updates), self.merge())
         self.assertEqual(original, self.gamelist.read_bytes())
+
+    def test_literal_leading_and_trailing_media_path_spaces_are_preserved(self):
+        custom = self.root / ' custom-art' / 'picture.png '
+        custom.parent.mkdir()
+        custom.write_bytes(b'custom image')
+        reference = ' custom-art/picture.png '
+        for field in ('thumbnail', 'image'):
+            with self.subTest(field=field):
+                original = ('<gameList><game><path>nested/My Game.sfc</path>'
+                            f'<{field}>{reference}</{field}></game></gameList>').encode()
+                self.gamelist.write_bytes(original)
+                self.assertEqual(set(self.updates), self.merge())
+                self.assertEqual(reference, self.fields()[field])
+                if field == 'thumbnail':
+                    self.assertEqual(original, self.gamelist.read_bytes())
+                else:
+                    self.assertEqual('./images/novacore/box.png', self.fields()['thumbnail'])
 
     def test_external_absolute_existing_artwork_is_preserved(self):
         with tempfile.TemporaryDirectory() as other:

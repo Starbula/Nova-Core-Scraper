@@ -22,6 +22,7 @@ from xml.dom import Node, minidom
 from xml.parsers.expat import ExpatError
 
 from .models import System
+from .paths import xml_path_text
 
 
 MAX_XML_BYTES = 128 * 1024 * 1024
@@ -198,9 +199,10 @@ def _children(element: minidom.Element, tag: str) -> list[minidom.Element]:
             if child.nodeType == Node.ELEMENT_NODE and child.tagName == tag]
 
 
-def _text(element: minidom.Element) -> str:
-    return ''.join(child.data for child in element.childNodes
-                   if child.nodeType in (Node.TEXT_NODE, Node.CDATA_SECTION_NODE)).strip()
+def _text(element: minidom.Element, *, trim: bool = True) -> str:
+    value = ''.join(child.data for child in element.childNodes
+                    if child.nodeType in (Node.TEXT_NODE, Node.CDATA_SECTION_NODE))
+    return value.strip() if trim else value
 
 
 def _game_key(reference: str, root: Path) -> str | None:
@@ -225,7 +227,7 @@ def _reference_is_valid(element: minidom.Element, root: Path) -> bool:
     # Nested/custom syntax is unknown to this application and must survive.
     if any(child.nodeType == Node.ELEMENT_NODE for child in element.childNodes):
         return True
-    reference = _text(element)
+    reference = xml_path_text(_text(element, trim=False))
     if not reference:
         return False
     # Windows expanduser can invent a sibling profile for an unknown explicit
@@ -378,7 +380,7 @@ def merge_artwork(system: System, updates: dict[str, Path],
         for game in _children(container, 'game'):
             paths = _children(game, 'path')
             if paths:
-                key = _game_key(_text(paths[0]), root)
+                key = _game_key(xml_path_text(_text(paths[0], trim=False)), root)
                 if key is not None:
                     index.setdefault(key.casefold(), []).append(game)
         accepted = set()

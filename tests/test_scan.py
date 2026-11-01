@@ -69,7 +69,7 @@ class ConsoleScanTests(unittest.TestCase):
 
     def test_exception_is_reported_instead_of_returning_partial_library(self):
         with patch.object(scan, 'scan_system', side_effect=OSError('fixture unreadable')):
-            with self.assertRaisesRegex(OSError,'fixture unreadable'):
+            with self.assertRaisesRegex(scan.ScanError,'fixture unreadable'):
                 scan.scan_library(self.root)
 
     def test_failed_console_cancels_its_other_active_worker(self):
@@ -93,6 +93,16 @@ class ConsoleScanTests(unittest.TestCase):
                 time.sleep(.005)
             return []
         with patch.object(scan, 'scan_system', side_effect=worker):
-            with self.assertRaisesRegex(OSError,'fixture unreadable'):
+            with self.assertRaisesRegex(scan.ScanError,'fixture unreadable'):
                 scan.scan_library(self.root)
         self.assertTrue(cancel_seen.is_set(), 'A failed scan must cancel the other worker too.')
+
+    def test_console_failure_names_the_console_and_preserves_the_original_error(self):
+        with patch.object(scan, 'scan_system', side_effect=ValueError('fixture bad entry')):
+            with self.assertLogs('novacore_scraper.scan', level='ERROR') as logs:
+                with self.assertRaises(scan.ScanError) as failed:
+                    scan.scan_library(self.root)
+        self.assertIn('Could not scan', str(failed.exception))
+        self.assertIsInstance(failed.exception.__cause__, ValueError)
+        self.assertIn('fixture bad entry', '\n'.join(logs.output))
+        self.assertIn(str(self.root/'roms'), '\n'.join(logs.output))

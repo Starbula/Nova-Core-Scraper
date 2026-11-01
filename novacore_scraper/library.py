@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from functools import lru_cache
 import hashlib
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -20,6 +21,9 @@ from typing import Callable, Iterable
 import xml.etree.ElementTree as ET
 
 from .models import Game, System
+from .paths import xml_path_text
+
+LOG = logging.getLogger(__name__)
 
 # Conservative launch formats, not emulator availability or playability claims.
 _COMMON = {
@@ -50,6 +54,7 @@ _COMMON = {
 }
 _IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
 _MANIFEST_EXTENSIONS = frozenset({'.m3u', '.cue', '.gdi', '.ccd'})
+_INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # Only image files are retained; a full ROM index is not kept between scans.
 _ARTWORK_SNAPSHOTS: OrderedDict[str, tuple[tuple[int, int], dict[str, Path]]] = OrderedDict()
 _ARTWORK_SNAPSHOT_LOCK = threading.Lock()
@@ -68,10 +73,10 @@ def _has_link_ancestor(path: Path) -> bool:
     return any(_is_link(part) for part in (path, *path.parents))
 
 
-def _relative(raw: str, base: PurePosixPath = PurePosixPath(), *, parent: bool = False) -> str | None:
-    """Apply Windows path rules even on non-Windows fixture hosts."""
-    raw = raw.strip().replace('\\', '/')
-    if not raw or '\x00' in raw or raw.startswith(('/', '~')) or re.match(r'^[a-zA-Z]:', raw):
+def _relative(raw: str, base: PurePosixPath = PurePosixPath(), *, parent: bool = False, literal: bool = False) -> str | None:
+    """Keep exact filename whitespace; only literal game keys allow leading ~."""
+    raw = (raw if literal else xml_path_text(raw)).replace('\\', '/')
+    if not raw or '\x00' in raw or raw.startswith('/') or (not literal and raw.startswith('~')) or re.match(r'^[a-zA-Z]:', raw):
         return None
     parts = list(base.parts)
     for piece in raw.split('/'):
@@ -171,7 +176,7 @@ def _configured_path(root: Path, name: str, raw: str) -> Path | None:
         relative = normalized.relative_to(root/'roms').as_posix()
     except ValueError:
         return None
-    relative = _relative(relative)
+    relative = _relative(relative, literal=True)
     if not relative or _has_link_ancestor(path):
         return None
     safe = _safe_path(root/'roms', relative)
@@ -281,7 +286,7 @@ def _gamelist(root: Path) -> dict[str, tuple[str, list[str]]]:
 
 def artwork_destination(game: Game) -> Path:
     """Stable path across drive moves, distinct for identical nested ROM names."""
-    relative = _relative(game.relative_path)
+    relative = _relative(game.relative_path, literal=True)
     if not relative:
         raise ValueError('Game path must be system-relative.')
     stem = PurePosixPath(relative).stem
@@ -317,7 +322,7 @@ def _checked_artwork(path: Path) -> Path | None:
 
 def _local_metadata_path(root: Path, raw: str) -> Path | None:
     """Read-only media may be shared; ROM paths still use strict _relative."""
-    raw = raw.strip().replace('\\', '/')
+    raw = xml_path_text(raw).replace('\\', '/')
     if not raw or '\x00' in raw or raw.startswith('//') or '://' in raw:
         return None
     path = Path(raw)
@@ -444,7 +449,7 @@ def existing_artwork(game: Game) -> Path | None:
     """
     if _has_link_ancestor(game.system.path):
         return None
-    relative = _relative(game.relative_path)
+    relative = _relative(game.relative_path, literal=True)
     if not relative:
         return None
     _, images = _gamelist(game.system.path).get(relative.casefold(), ('', []))
@@ -533,6 +538,9 @@ def scan_system(system: System, cancelled: Callable[[], bool] = lambda: False) -
                         continue
                     folded = name.casefold()
                     relative = prefix + name
+                    if _INVALID_FILENAME.search(name):
+                        LOG.warning('Skipping invalid library filename in %s: %r', system.name, relative)
+                        continue
                     key = relative.casefold()
                     extension = '.' + folded.rsplit('.', 1)[1] if '.' in folded else ''
                     try:
@@ -582,7 +590,7 @@ def scan_system(system: System, cancelled: Callable[[], bool] = lambda: False) -
             return []
         parent = PurePosixPath(relative).parent
         for raw in _manifest_references(path):
-            reference = _relative(raw, parent, parent=True)
+            reference = _relative(raw, parent, parent=True, literal=True)
             if reference and reference.casefold() in files:
                 referenced.add(reference.casefold())
     games = []

@@ -209,6 +209,98 @@ class LibraryTests(unittest.TestCase):
         with patch.object(os, 'scandir', SwapAfterListing):
             self.assertEqual(library.scan_system(system), [])
 
+    def test_scan_literal_tilde_rom_and_nested_directory_without_crashing(self):
+        system = self.system('snes', ('.sfc',))
+        paths = ('~Game.sfc', '~Homebrew/Game.sfc')
+        for relative in paths:
+            self.write('roms/snes/'+relative, 'rom')
+        games = library.scan_system(system)
+        self.assertEqual([game.relative_path for game in games], ['~Game.sfc', '~Homebrew/Game.sfc'])
+        for game in games:
+            self.assertIsNone(library.existing_artwork(game))
+            self.assertEqual(library.artwork_destination(game).parent, system.path/'images'/'novacore')
+            self.assertEqual(game.path.read_text(), 'rom')
+
+    def test_formatted_xml_game_and_thumbnail_references_keep_metadata(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/A.sfc', 'rom')
+        box = self.write('roms/snes/custom/A.png', 'box')
+        self.write('roms/snes/gamelist.xml', '<gameList><game><path>\n  ./A.sfc\n</path><name> Formatted title </name><thumbnail>\n  ./custom/A.png\n</thumbnail></game></gameList>')
+        game = library.scan_system(system)[0]
+        self.assertEqual((game.relative_path, game.title, game.existing_artwork), ('A.sfc', 'Formatted title', box))
+        self.assertEqual(library.existing_artwork(game), box)
+
+    def test_formatted_xml_directory_game_prunes_its_contents(self):
+        system = self.system('ps3', ('.iso',))
+        self.write('roms/ps3/Folder Game/PS3_GAME/data.iso', 'data')
+        self.write('roms/ps3/gamelist.xml', '<gameList><game><path>\n  ./Folder Game\n</path><name>Folder title</name></game></gameList>')
+        games = library.scan_system(system)
+        self.assertEqual([(game.relative_path, game.title) for game in games], [('Folder Game', 'Folder title')])
+
+    def test_explicit_xml_relative_tilde_game_keeps_title_and_thumbnail(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/~Game.sfc', 'rom')
+        art = self.write('roms/snes/custom/A.png', 'box')
+        self.write('roms/snes/gamelist.xml', '<gameList><game><path>./~Game.sfc</path><name>Named Homebrew</name><thumbnail>custom/A.png</thumbnail></game></gameList>')
+        game = library.scan_system(system)[0]
+        self.assertEqual((game.relative_path, game.title, game.existing_artwork), ('~Game.sfc', 'Named Homebrew', art))
+        self.assertEqual(library.existing_artwork(game), art)
+
+    def test_whitespace_in_game_key_is_preserved_in_metadata_and_artwork_hash(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/ Game.sfc', 'spaced rom')
+        self.write('roms/snes/Game.sfc', 'plain rom')
+        art = self.write('roms/snes/custom/A.png', 'box')
+        self.write('roms/snes/gamelist.xml', '<gameList><game><path> Game.sfc</path><name>Spaced game</name><thumbnail>custom/A.png</thumbnail></game></gameList>')
+        games = {game.relative_path: game for game in library.scan_system(system)}
+        self.assertEqual(games[' Game.sfc'].title, 'Spaced game')
+        self.assertEqual(games['Game.sfc'].title, 'Game')
+        self.assertEqual(library.existing_artwork(games[' Game.sfc']), art)
+        self.assertIsNone(library.existing_artwork(games['Game.sfc']))
+        self.assertNotEqual(library.artwork_destination(games[' Game.sfc']), library.artwork_destination(games['Game.sfc']))
+
+    def test_thumbnail_whitespace_does_not_select_a_different_existing_file(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/A.sfc', 'rom')
+        self.write('roms/snes/custom/A.png', 'wrong box')
+        exact = self.write('roms/snes/ custom/A.png', 'exact box')
+        self.write('roms/snes/gamelist.xml', '<gameList><game><path>A.sfc</path><thumbnail> custom/A.png</thumbnail></game></gameList>')
+        game = library.scan_system(system)[0]
+        self.assertEqual(game.existing_artwork, exact)
+        self.assertEqual(library.existing_artwork(game), exact)
+
+    def test_literal_key_trailing_space_is_not_silently_mapped_to_different_game(self):
+        system = self.system('snes', ('.sfc',))
+        one = Game(system, system.path/'Game.sfc ', 'Game.sfc ', 'Spaced')
+        two = Game(system, system.path/'Game.sfc', 'Game.sfc', 'Plain')
+        self.assertNotEqual(library.artwork_destination(one), library.artwork_destination(two))
+        art = self.write('roms/snes/custom/A.png', 'other game box')
+        self.write('roms/snes/gamelist.xml', '<gameList><game><path>Game.sfc</path><thumbnail>custom/A.png</thumbnail></game></gameList>')
+        self.assertIsNone(library.existing_artwork(one))
+        self.assertEqual(library.existing_artwork(two), art)
+
+    def test_xml_home_and_absolute_game_references_remain_rejected(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/~Game.sfc', 'rom')
+        art = self.write('roms/snes/custom/A.png', 'box')
+        for reference in ('~Game.sfc', '~/Game.sfc', '../Game.sfc', '/Game.sfc', 'C:/Game.sfc', 'Game.sfc:stream'):
+            with self.subTest(reference=reference):
+                self.write('roms/snes/gamelist.xml', '<gameList><game><path>'+reference+'</path><name>Unsafe match</name><thumbnail>custom/A.png</thumbnail></game></gameList>')
+                game = library.scan_system(system)[0]
+                self.assertEqual(game.title, '~Game')
+                self.assertIsNone(game.existing_artwork)
+
+    @unittest.skipIf(os.name == 'nt', 'colon fixture is illegal on Windows')
+    def test_invalid_windows_filename_is_warned_and_skipped_without_aborting_system(self):
+        system = self.system('snes', ('.sfc',))
+        self.write('roms/snes/Bad:Name.sfc', 'invalid rom')
+        self.write('roms/snes/Good.sfc', 'good rom')
+        with self.assertLogs('novacore_scraper.library', level='WARNING') as captured:
+            games = library.scan_system(system)
+        self.assertEqual([game.relative_path for game in games], ['Good.sfc'])
+        self.assertTrue(any('Bad:Name.sfc' in message and 'snes' in message for message in captured.output))
+        self.assertEqual((system.path/'Bad:Name.sfc').read_text(), 'invalid rom')
+
     def test_fallback_only_includes_existing_common_system_directories(self):
         self.system('snes', ('.sfc',))
         self.system('psx')

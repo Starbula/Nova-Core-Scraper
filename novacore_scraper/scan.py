@@ -2,6 +2,7 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
+import logging
 import threading
 from typing import Callable
 from .library import discover_systems, scan_system, validate_retrobat
@@ -10,6 +11,11 @@ from .models import Game, System
 # Two concurrent enumerations overlap slow filesystem calls without flooding a
 # portable hard drive with a worker for every configured system.
 CONSOLE_WORKERS = 2
+LOG = logging.getLogger(__name__)
+
+
+class ScanError(RuntimeError):
+    """A console scan failed; the message identifies which console to inspect."""
 
 
 def scan_library(root: Path, *, cancelled: Callable[[], bool] = lambda: False,
@@ -43,7 +49,11 @@ def scan_library(root: Path, *, cancelled: Callable[[], bool] = lambda: False,
                 finished, _ = wait(pending, timeout=.1, return_when=FIRST_COMPLETED)
                 for future in finished:
                     system = pending.pop(future)
-                    result = future.result()
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        LOG.exception('Console scan failed for %s at %s', system.fullname, system.path)
+                        raise ScanError(f'Could not scan {system.fullname}: {exc}') from exc
                     if cancelled():
                         return None
                     games[system.name] = result
