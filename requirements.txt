@@ -1,0 +1,3 @@
+requests>=2.32.4,<3
+Pillow>=12,<13
+psutil>=7,<8
