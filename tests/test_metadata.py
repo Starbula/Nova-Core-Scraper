@@ -162,6 +162,16 @@ class MetadataTests(unittest.TestCase):
                 self.assertEqual(reference, self.fields()['image'])
                 self.assertEqual('./images/novacore/box.png', self.fields()['thumbnail'])
 
+    def test_explicit_tilde_username_is_preserved_when_windows_invents_a_home_path(self):
+        reference = '~unknown_novacore_user/artwork.png'
+        self.gamelist.write_text('<gameList><game><path>nested/My Game.sfc</path>'
+                                 f'<image>{reference}</image></game></gameList>')
+        invented_home_path = self.root / 'absent-user-profile' / 'artwork.png'
+        with mock.patch.object(metadata.os.path, 'expanduser', return_value=str(invented_home_path)):
+            self.assertEqual(set(self.updates), self.merge())
+        self.assertEqual(reference, self.fields()['image'])
+        self.assertEqual('./images/novacore/box.png', self.fields()['thumbnail'])
+
     def test_broken_references_are_filled_and_existing_name_remains(self):
         self.gamelist.write_text('<gameList><game><path>./nested/My Game.sfc</path>'
                                  '<name>Special</name><thumbnail>./missing.png</thumbnail>'

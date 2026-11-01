@@ -228,6 +228,10 @@ def _reference_is_valid(element: minidom.Element, root: Path) -> bool:
     reference = _text(element)
     if not reference:
         return False
+    # Windows expanduser can invent a sibling profile for an unknown explicit
+    # username. That is not proof the user's original reference is broken.
+    if reference.startswith('~') and len(reference) > 1 and reference[1] not in '/\\':
+        return True
     expanded = os.path.expanduser(os.path.expandvars(reference))
     # Do not destroy remote paths, foreign drive letters, or unavailable custom
     # variable conventions simply because this host cannot resolve them.
