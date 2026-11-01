@@ -151,7 +151,7 @@ def _xml(path: Path, limit: int) -> ET.Element:
 def _configured_path(root: Path, name: str, raw: str) -> Path | None:
     raw = raw.strip().replace('\\', '/')
     raw = re.sub('%ROMPATH%', lambda _match: (root/'roms').as_posix(), raw, flags=re.I)
-    if not raw or '%' in raw or '\x00' in raw or raw.startswith('//') or '..' in raw.split('/'):
+    if not raw or '%' in raw or '\x00' in raw or raw.startswith('//') or (raw.startswith('~') and not raw.startswith('~/')):
         return None
     if raw.startswith('~/'):
         path = root/'emulationstation'/raw[2:]
@@ -161,18 +161,21 @@ def _configured_path(root: Path, name: str, raw: str) -> Path | None:
             return None
         if not path.is_absolute():
             path = root/path
+    # Standard RetroBat paths are ~\\..\\roms\\<system>. Normalize only
+    # after retaining the original traversal for symlink/junction checks.
+    normalized = Path(os.path.normpath(str(path)))
     try:
-        relative = path.relative_to(root/'roms').as_posix()
+        relative = normalized.relative_to(root/'roms').as_posix()
     except ValueError:
         return None
     relative = _relative(relative)
-    if not relative:
+    if not relative or _has_link_ancestor(path):
         return None
     safe = _safe_path(root/'roms', relative)
     return safe if safe and safe.is_dir() else None
 
 
-def _config_entries(path: Path, root: Path) -> dict[str, System | None]:
+def _config_entries(path: Path, root: Path, base: dict[str, System | None] | None = None) -> dict[str, System | None]:
     tree = _xml(path, 2 * 1024 * 1024)
     if tree.tag != 'systemList':
         raise ValueError('Unrecognised RetroBat system configuration.')
@@ -181,17 +184,26 @@ def _config_entries(path: Path, root: Path) -> dict[str, System | None]:
         name = (item.findtext('name') or '').strip().casefold()
         if not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', name):
             continue
-        extensions = frozenset(e.casefold() for e in (item.findtext('extension') or '').split() if re.fullmatch(r'\.[a-zA-Z0-9]+', e) and e.casefold() != '.fake')
+        previous = result.get(name, (base or {}).get(name))
+        extension_node = item.find('extension')
+        if extension_node is None and previous is not None:
+            extensions = previous.extensions
+        else:
+            extensions = frozenset(e.casefold() for e in (item.findtext('extension') or '').split() if re.fullmatch(r'\.[a-zA-Z0-9]+', e) and e.casefold() != '.fake')
         path_node = item.find('path')
-        raw = 'roms/' + name if path_node is None else path_node.text or ''
+        if path_node is None:
+            raw = str(previous.path) if previous is not None else 'roms/' + name
+        else:
+            raw = path_node.text or ''
         directory = _configured_path(root, name, raw)
         if not directory or not extensions:
             result[name] = None  # An unsafe/disabled custom override disables its base entry.
             continue
-        screen_id = (item.findtext('screenscraper') or item.findtext('screenscraper_id') or '').strip()
+        screen_id = (item.findtext('screenscraper') or item.findtext('screenscraper_id') or (previous.screenscraper_id if previous is not None else '') or '').strip()
         if not screen_id.isdigit():
             screen_id = _COMMON.get(name, ('', '', None))[2]
-        result[name] = System(name, (item.findtext('fullname') or name).strip(), directory, extensions, screen_id)
+        fullname = (item.findtext('fullname') or (previous.fullname if previous is not None else name)).strip()
+        result[name] = System(name, fullname, directory, extensions, screen_id)
     return result
 
 
@@ -205,11 +217,12 @@ def discover_systems(root: Path) -> list[System]:
         if _has_link_ancestor(primary):
             return []
         systems = _config_entries(primary, root)
-        custom = primary.with_name('es_systems_custom.cfg')
-        if custom.exists():
+        # RetroBat also creates per-system es_systems_<name>.cfg overlays.
+        # Inherit omitted fields so emulator-only overrides keep ROM formats.
+        for custom in sorted(primary.parent.glob('es_systems_*.cfg'), key=lambda path: path.name.casefold()):
             if _has_link_ancestor(custom):
                 return []
-            systems.update(_config_entries(custom, root))
+            systems.update(_config_entries(custom, root, systems))
         return [system for _, system in sorted(systems.items()) if system is not None]
     except (OSError, ValueError, ET.ParseError):
         # A broken present config must not silently enable unrelated fallback systems.

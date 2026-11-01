@@ -34,6 +34,9 @@ class ConsoleSelectionTests(unittest.TestCase):
         self.assertEqual(selection.selected, {'snes', 'psx'})
 
     def test_rescan_retains_empty_selection_and_removes_disappeared_systems(self):
+        empty = ui.ConsoleSelection([])
+        empty.replace_systems(systems())
+        self.assertEqual(empty.selected, set())
         selection = ui.ConsoleSelection(['nes', 'obsolete'])
         selection.replace_systems(systems())
         self.assertEqual(selection.selected, {'nes'})
@@ -115,6 +118,8 @@ class TkTests(unittest.TestCase):
     def test_filter_render_preserves_selection(self):
         self.app.selection.replace_systems(systems())
         self.app._render_systems()
+        self.assertEqual(self.app.selection.selected, set())
+        self.app._select_visible(True)
         self.app.filter_var.set('Sony')
         self.app._render_systems()
         self.assertEqual(self.app.tree.get_children(), ('psx',))

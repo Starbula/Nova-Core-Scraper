@@ -36,7 +36,7 @@ def self_test(output: Path) -> bool:
             rom = system_path/'Example (Europe).nes'
             rom.write_bytes(b'ROM fixture must stay unchanged')
             original = rom.read_bytes()
-            validate_retrobat(root)
+            root = validate_retrobat(root)
             systems = discover_systems(root)
             nes = next(s for s in systems if s.name == 'nes')
             games = scan_system(nes)

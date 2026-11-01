@@ -14,7 +14,7 @@ class LibraryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / 'RetroBat'
+        self.root = (Path(self.temp.name) / 'RetroBat').resolve()
         (self.root / 'roms').mkdir(parents=True)
         (self.root / 'RetroBat.exe').write_bytes(b'fixture')
 
@@ -54,6 +54,48 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(systems[1].fullname, 'Custom SNES')
         self.assertEqual(systems[1].extensions, frozenset({'.sfc'}))
         self.assertEqual(systems[1].screenscraper_id, '4')
+
+    def test_standard_retrobat_tilde_parent_paths_discover_and_scan(self):
+        self.system('nes', ('.nes',))
+        self.system('ps2', ('.iso',))
+        self.system('snes', ('.sfc',))
+        self.write('roms/nes/Mario.nes', 'rom')
+        self.config(r'<system><name>nes</name><fullname>Nintendo Entertainment System - Famicom</fullname><path>~\..\roms\nes</path><extension>.fds .nes .wad .zip .7z</extension></system><system><name>ps2</name><path>~/../roms/ps2</path><extension>.iso</extension></system><system><name>snes</name><path>emulationstation/../roms/snes</path><extension>.sfc</extension></system>')
+        systems = library.discover_systems(self.root)
+        self.assertEqual([system.name for system in systems], ['nes', 'ps2', 'snes'])
+        self.assertEqual([system.path for system in systems], [self.root/'roms'/'nes', self.root/'roms'/'ps2', self.root/'roms'/'snes'])
+        self.assertEqual([game.relative_path for game in library.scan_system(systems[0])], ['Mario.nes'])
+
+    def test_normalized_config_paths_still_reject_final_outside_roms(self):
+        self.system('nes', ('.nes',))
+        (self.root/'outside').mkdir()
+        for raw in ('~/../outside', 'emulationstation/../../outside', 'roms/nes/../../outside'):
+            with self.subTest(path=raw):
+                self.config('<system><name>nes</name><path>'+raw+'</path><extension>.nes</extension></system>')
+                self.assertEqual(library.discover_systems(self.root), [])
+
+    def test_normalization_does_not_erase_linked_traversal_ancestor(self):
+        self.system('nes', ('.nes',))
+        outside = self.root.parent/'outside'
+        outside.mkdir()
+        try:
+            (self.root/'roms'/'linked').symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest('symlinks unavailable')
+        self.config('<system><name>nes</name><path>roms/linked/../nes</path><extension>.nes</extension></system>')
+        self.assertEqual(library.discover_systems(self.root), [])
+
+    def test_additional_system_config_filenames_merge_partial_overrides(self):
+        self.system('nes', ('.nes',))
+        self.system('snes', ('.sfc',))
+        self.config('<system><name>nes</name><fullname>Nintendo</fullname><path>roms/nes</path><extension>.nes .zip</extension></system>')
+        self.write('emulationstation/.emulationstation/es_systems_nes.cfg', '<systemList><system><name>nes</name><fullname>Custom Nintendo</fullname><emulators><emulator name="mesen"/></emulators></system></systemList>')
+        self.write('emulationstation/.emulationstation/es_systems_snes.cfg', '<systemList><system><name>snes</name><path>roms/snes</path><extension>.sfc</extension></system></systemList>')
+        systems = library.discover_systems(self.root)
+        self.assertEqual([system.name for system in systems], ['nes', 'snes'])
+        self.assertEqual(systems[0].fullname, 'Custom Nintendo')
+        self.assertEqual(systems[0].extensions, frozenset({'.nes', '.zip'}))
+        self.assertEqual(systems[0].path, self.root/'roms'/'nes')
 
     def test_fallback_only_includes_existing_common_system_directories(self):
         self.system('snes', ('.sfc',))

@@ -50,6 +50,13 @@ def _revision(info: os.stat_result) -> tuple[int, ...]:
             info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _cross_api_revision(info: os.stat_result) -> tuple[int, ...]:
+    # CPython 3.12+ on Windows can report creation time through lstat but
+    # change time through fstat. Compare ctime only within the same API;
+    # retain identity, size and mtime when checking the descriptor's path.
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def _is_link(info: os.stat_result) -> bool:
     # Windows junctions and other reparse points need the same treatment as
     # symlinks. pathlib.is_symlink alone does not catch every reparse point.
@@ -126,6 +133,8 @@ def _read_snapshot(root: Path, path: Path) -> _Snapshot | None:
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
+        if initial is not None:
+            raise ConflictError('The gamelist disappeared while it was being read') from None
         return None
     try:
         stream = os.fdopen(descriptor, 'rb')
@@ -143,10 +152,14 @@ def _read_snapshot(root: Path, path: Path) -> _Snapshot | None:
     if len(data) > MAX_XML_BYTES:
         raise MetadataError('The gamelist exceeds the XML size limit')
     current = _safe_path(root, path, missing=True)
-    if (current is None or _revision(before) != _revision(after) or
-            _revision(after) != _revision(current)):
+    if (initial is None or current is None or
+            _revision(initial) != _revision(current) or
+            _revision(before) != _revision(after) or
+            _cross_api_revision(initial) != _cross_api_revision(before) or
+            _cross_api_revision(after) != _cross_api_revision(current) or
+            len(data) != after.st_size):
         raise ConflictError('The gamelist changed while it was being read')
-    return _Snapshot(data, _revision(after), hashlib.sha256(data).digest(),
+    return _Snapshot(data, _revision(current), hashlib.sha256(data).digest(),
                      stat.S_IMODE(after.st_mode))
 
 
@@ -230,6 +243,13 @@ def _reference_is_valid(element: minidom.Element, root: Path) -> bool:
     try:
         return stat.S_ISREG(path.stat().st_mode)
     except (FileNotFoundError, NotADirectoryError):
+        # A missing file on an available drive is broken. An unavailable
+        # custom drive or UNC share cannot establish that the art is missing.
+        if path.is_absolute() and path.anchor:
+            try:
+                Path(path.anchor).stat()
+            except (OSError, ValueError):
+                return True
         return False
     except (OSError, ValueError):
         # Permission errors, unavailable network shares and unfamiliar path

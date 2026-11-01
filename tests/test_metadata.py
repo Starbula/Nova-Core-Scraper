@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from pathlib import PureWindowsPath
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from xml.dom import minidom
@@ -196,6 +198,38 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(set(self.updates), self.merge())
         self.assertEqual('./nested/My Game.sfc', self.fields()['path'])
 
+    def test_windows_fstat_change_time_can_differ_from_lstat_creation_time(self):
+        self.gamelist.write_bytes(b'<gameList/>')
+        original_fstat = metadata.os.fstat
+        def windows_fstat(descriptor):
+            original = original_fstat(descriptor)
+            fields = {name: getattr(original, name) for name in
+                      ('st_dev', 'st_ino', 'st_size', 'st_mode', 'st_mtime_ns', 'st_ctime_ns')}
+            fields['st_ctime_ns'] += 100_000_000
+            return SimpleNamespace(**fields)
+        with mock.patch.object(metadata.os, 'fstat', side_effect=windows_fstat):
+            self.assertEqual(set(self.updates), self.merge())
+            self.assertEqual(set(self.updates), self.merge())
+        self.assertEqual('./images/novacore/box.png', self.fields()['thumbnail'])
+
+    def test_unavailable_windows_drive_reference_is_preserved(self):
+        class UnavailableDrivePath(PureWindowsPath):
+            def stat(self):
+                raise FileNotFoundError('Drive is not mounted')
+        element = minidom.parseString('<image>Z:/custom/artwork.png</image>').documentElement
+        with mock.patch.object(metadata, 'Path', UnavailableDrivePath):
+            self.assertTrue(metadata._reference_is_valid(element, self.root))
+
+    def test_missing_file_on_available_windows_drive_is_broken(self):
+        class AvailableDrivePath(PureWindowsPath):
+            def stat(self):
+                if str(self) == self.anchor:
+                    return SimpleNamespace(st_mode=0o040755)
+                raise FileNotFoundError('Image is missing')
+        element = minidom.parseString('<image>Z:/custom/artwork.png</image>').documentElement
+        with mock.patch.object(metadata, 'Path', AvailableDrivePath):
+            self.assertFalse(metadata._reference_is_valid(element, self.root))
+
     def test_running_at_start_performs_zero_writes(self):
         with mock.patch.object(metadata.tempfile, 'mkstemp', side_effect=AssertionError('write')):
             self.assertEqual(set(), self.merge(lambda: True))
@@ -241,6 +275,36 @@ class MetadataTests(unittest.TestCase):
             with self.assertRaises(metadata.ConflictError):
                 self.merge()
         self.assertEqual(external, self.gamelist.read_bytes())
+
+    def test_digest_detects_same_length_edit_with_restored_mtime_and_creation_time(self):
+        original = b'<gameList a="1"/>'
+        external = b'<gameList a="2"/>'
+        self.gamelist.write_bytes(original)
+        original_stat = self.gamelist.stat()
+        original_fsync = metadata.os.fsync
+        original_safe_path = metadata._safe_path
+        changed = False
+        def rewrite_with_original_mtime(descriptor):
+            nonlocal changed
+            original_fsync(descriptor)
+            if not changed:
+                changed = True
+                self.gamelist.write_bytes(external)
+                os.utime(self.gamelist, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        def windows_creation_time(root, path, **kwargs):
+            info = original_safe_path(root, path, **kwargs)
+            if path != self.gamelist or info is None:
+                return info
+            fields = {name: getattr(info, name) for name in
+                      ('st_dev', 'st_ino', 'st_size', 'st_mode', 'st_mtime_ns')}
+            fields['st_ctime_ns'] = original_stat.st_ctime_ns
+            return SimpleNamespace(**fields)
+        with mock.patch.object(metadata.os, 'fsync', side_effect=rewrite_with_original_mtime), \
+                mock.patch.object(metadata, '_safe_path', side_effect=windows_creation_time):
+            with self.assertRaises(metadata.ConflictError):
+                self.merge()
+        self.assertEqual(external, self.gamelist.read_bytes())
+        self.assert_no_temporary_files()
 
     def test_concurrent_writer_during_backup_is_not_overwritten(self):
         self.gamelist.write_bytes(b'<gameList/>')
