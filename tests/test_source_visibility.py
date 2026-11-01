@@ -259,8 +259,11 @@ def test_engine_persists_complete_attempts_in_history_and_export(tmp_path):
     assert 'IGDB: downloaded' in jobs['good'].source_trace
     assert 'Libretro: no title match' in jobs['unresolved'].source_trace
     assert 'IGDB: no title match' in jobs['unresolved'].source_trace
+    assert engine.job_snapshot(games[0].key) == jobs['good']
+    assert engine.job_snapshot('not a submitted game') is None
     history, total = State.downloaded_page(tmp_path)
     assert total == 1 and history[0]['source_trace'] == jobs['good'].source_trace
+    assert engine.downloaded_page()[0][0].source_trace == jobs['good'].source_trace
     destination = tmp_path/'report.csv'
     assert State.export_report(tmp_path, destination) == 2
     with destination.open(encoding='utf-8-sig', newline='') as stream:

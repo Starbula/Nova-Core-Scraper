@@ -520,6 +520,12 @@ class App:
         page = self._pages[name]
         selected = page['tree'].selection()
         row = page['rows'].get(selected[0]) if selected else None
+        if name == 'jobs' and selected:
+            current = getattr(self.engine, 'job_snapshot', None)
+            fresh = current(selected[0]) if callable(current) else None
+            if fresh is not None:
+                row = fresh
+                page['rows'][selected[0]] = fresh
         if row is None:
             self._set_readonly_text(page['detail_text'], 'Select a game to inspect its result and source attempts.')
             return

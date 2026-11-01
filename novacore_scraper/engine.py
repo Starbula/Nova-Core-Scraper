@@ -113,6 +113,11 @@ class ScrapeEngine:
         with self._condition:
             return self._progress
 
+    def job_snapshot(self, key: str) -> JobSnapshot | None:
+        """Read one current immutable result without waiting for paged UI refresh."""
+        with self._condition:
+            return self._jobs.get(key)
+
     @property
     def jobs_revision(self) -> int:
         with self._condition:
@@ -160,7 +165,7 @@ class ScrapeEngine:
             row['key'], row['title'], row['system_fullname'] or row['system_name'],
             row['status'], str(self.root/row['artwork']) if row['artwork'] else '',
             row['detail'], row['reason'], row['source'], row['region'], row['match_note'],
-            row['attempts'], bool(row['retryable'])) for row in rows], total
+            row['attempts'], bool(row['retryable']), row.get('source_trace', '')) for row in rows], total
 
     def _update(self, **values):
         with self._condition:

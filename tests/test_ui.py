@@ -904,6 +904,38 @@ class TkTests(unittest.TestCase):
         self.assertTrue(closed.is_set())
         self.assertTrue(self.app._diagnostic_cancel.is_set())
 
+    def test_show_details_refreshes_a_stale_current_job_without_changing_download_history(self):
+        from types import SimpleNamespace
+        from novacore_scraper.engine import JobSnapshot
+        key = 'gba/game'
+        stale = JobSnapshot(key, 'Game', 'GBA', 'checking')
+        fresh = JobSnapshot(key, 'Game', 'GBA', 'completed', detail='Source: IGDB', source='IGDB',
+                            source_trace='Libretro: no match; IGDB: downloaded')
+        historical = JobSnapshot(key, 'Game', 'GBA', 'completed', artwork='/previous/cover.png',
+                                 source='LaunchBox', source_trace='LaunchBox: downloaded')
+        reads = []
+        def snapshot(selected):
+            reads.append(selected)
+            return fresh
+        self.app.engine = SimpleNamespace(active=False, snapshot=lambda:Progress(state='Finished'), job_snapshot=snapshot)
+        for name, row in (('jobs', stale), ('downloaded', historical)):
+            page = self.app._pages[name]
+            page['rows'][key] = row
+            page['tree'].insert('', 'end', iid=key, values=(row.title, row.console, row.status, ''))
+            page['tree'].selection_set(key)
+        self.app._show_job_details('jobs')
+        details = self.app._pages['jobs']['detail_text'].get('1.0', 'end')
+        self.assertIn('Status: completed', details)
+        self.assertIn('IGDB: downloaded', details)
+        self.assertNotIn('Status: checking', details)
+        self.assertEqual(reads, [key])
+        self.app._show_job_details('downloaded')
+        history = self.app._pages['downloaded']['detail_text'].get('1.0', 'end')
+        self.assertIn('/previous/cover.png', history)
+        self.assertIn('LaunchBox: downloaded', history)
+        self.assertNotIn('IGDB', history)
+        self.assertEqual(reads, [key])
+
     def test_selected_game_details_show_full_source_trace_without_a_new_window(self):
         from types import SimpleNamespace
         from novacore_scraper.engine import JobSnapshot
