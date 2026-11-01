@@ -5,6 +5,7 @@ import io
 import os
 import time
 import zipfile
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -519,13 +520,13 @@ def test_schema_two_cache_is_refreshed_even_when_fresh_and_retains_metadata(tmp_
     p.prepare(lambda: None)
     p.close()
     index = next(cache.glob('*.sqlite3'))
-    with sqlite3.connect(index) as connection:
+    with closing(sqlite3.connect(index)) as connection, connection:
         connection.execute('PRAGMA user_version=2')
     transport[0].append(catalogue(games=[
         ('1', 'Alien 8', 'Sinclair ZX Spectrum', 'Ultimate Play The Game', '', '1985')]))
     p = LaunchBoxProvider(cache)
     assert p.find(game(tmp_path, 'Alien 8 (1985)(Ultimate Play The Game)', 'zxspectrum'), lambda: None)
-    with sqlite3.connect(index) as connection:
+    with closing(sqlite3.connect(index)) as connection:
         assert connection.execute('PRAGMA user_version').fetchone()[0] >= 3
         assert connection.execute('SELECT publisher, release_date, release_year FROM games').fetchone() == ('Ultimate Play The Game', '', '1985')
     assert len(transport[1]) == 2
@@ -540,7 +541,7 @@ def test_failed_schema_upgrade_preserves_previous_cache_atomically(tmp_path, tra
     p.prepare(lambda: None)
     p.close()
     index = next(cache.glob('*.sqlite3'))
-    with sqlite3.connect(index) as connection:
+    with closing(sqlite3.connect(index)) as connection, connection:
         connection.execute('PRAGMA user_version=2')
     previous = index.read_bytes()
     transport[0].append(b'invalid zip')
