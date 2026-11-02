@@ -4,7 +4,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from unittest.mock import patch
 from PIL import Image
@@ -187,6 +187,28 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(engine.wait(5))
         self.assertEqual(engine.artwork_counts(), {'nes': 2})
 
+    def test_artwork_updates_only_publish_confirmed_covers_once(self):
+        from novacore_scraper.library import artwork_destination
+        existing, new, missing, failed = [self.game(title) for title in ('existing', 'new', 'missing', 'failed')]
+        destination = artwork_destination(existing)
+        destination.parent.mkdir(parents=True)
+        Image.new('RGB', (2, 2), 'blue').save(destination)
+        engine = ScrapeEngine(self.root, FakeProvider(), process_running=lambda: True)
+        engine.start([existing, new, missing, failed])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual(engine.take_artwork_updates(), {existing.key: 'nes', new.key: 'nes'})
+        self.assertEqual(engine.take_artwork_updates(), {})
+        self.assertEqual(engine.artwork_counts(), {'nes': 2})
+        self.assertEqual(engine.snapshot().pending, 2)
+
+    def test_new_run_discards_unconsumed_artwork_updates(self):
+        engine = ScrapeEngine(self.root, FakeProvider(), process_running=lambda: True)
+        engine.start([self.game('new')])
+        self.assertTrue(engine.wait(5))
+        engine.start([self.game('missing')])
+        self.assertTrue(engine.wait(5))
+        self.assertEqual(engine.take_artwork_updates(), {})
+
     def test_cancelled_preflight_entry_keeps_existing_coverage_in_live_totals(self):
         from novacore_scraper.library import artwork_destination, existing_artwork
         missing, existing = self.game('new'), self.game('existing')
@@ -297,6 +319,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine.snapshot().skipped,1)
         self.assertEqual(provider.calls,[])
         self.assertTrue((self.path/'gamelist.xml').exists())
+
+    def test_scan_recovers_orphan_metadata_without_creating_artwork_jobs(self):
+        from novacore_scraper.engine import recover_scanned_artwork
+        from novacore_scraper.library import artwork_destination
+        game = self.game('orphan')
+        destination = artwork_destination(game)
+        destination.parent.mkdir(parents=True)
+        Image.new('RGB', (2, 2), 'blue').save(destination)
+        original = destination.read_bytes()
+        scanned = replace(game, existing_artwork=destination)
+        self.assertEqual(recover_scanned_artwork(self.root, [scanned]), 1)
+        self.assertFalse((self.path/'gamelist.xml').exists())
+        provider = FakeProvider()
+        engine = ScrapeEngine(self.root, provider, process_running=lambda: True)
+        engine.apply_pending()
+        self.assertEqual(engine.snapshot().pending, 1)
+        self.assertEqual(engine.jobs_page()[1], 0)
+        engine.process_running = lambda: False
+        engine.apply_pending()
+        self.assertEqual(engine.snapshot().pending, 0)
+        self.assertTrue((self.path/'gamelist.xml').exists())
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertEqual(game.path.read_bytes(), b'ROM unchanged')
 
     def test_literal_tilde_path_survives_scan_download_metadata_and_repeat(self):
         from novacore_scraper.library import scan_system

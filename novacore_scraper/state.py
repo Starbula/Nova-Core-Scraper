@@ -7,6 +7,7 @@ import tempfile
 import os
 import sqlite3
 import stat
+from .library import artwork_destination
 from .models import Game
 
 
@@ -201,6 +202,27 @@ class State:
 
     def downloaded(self, game: Game, artwork: Path, *, history: bool = True, **diagnostics):
         self.record(game, 'downloaded', artwork, True, history=history, **diagnostics)
+
+    def recover_scanned_artwork(self, games, cancelled=lambda:False) -> int:
+        """Queue unregistered NovaCore files already confirmed by the library scan."""
+        registered = {row['key']: row['artwork'] for row in self.db.execute('SELECT key,artwork FROM jobs')}
+        recovered = 0
+        with self.batch():
+            for game in games:
+                if cancelled():
+                    break
+                art = game.existing_artwork
+                if art is None or art != artwork_destination(game):
+                    continue
+                system_path = game.system.path.absolute().relative_to(self.root).as_posix()
+                key = system_path+'/'+game.relative_path
+                relative_art = art.absolute().relative_to(self.root).as_posix()
+                if registered.get(key) == relative_art:
+                    continue
+                self.downloaded(game, art, history=False)
+                registered[key] = relative_art
+                recovered += 1
+        return recovered
 
     def previous(self, game: Game):
         system_path = safe_path(self.root, game.system.path).relative_to(self.root).as_posix()

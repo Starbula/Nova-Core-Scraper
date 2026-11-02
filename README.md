@@ -16,7 +16,7 @@ For source use, install Python 3.11 or newer with Tcl/Tk support, extract or clo
 
 For an unattended run, keep **Automatic**, **Retry temporary failures**, **Keep PC awake**, and both cover-fallback options enabled in Settings. Optional provider accounts can be configured once before starting. Start waits for remembered credentials to load so a quick click cannot silently omit saved sources. You can play games in RetroBat while NovaCore downloads; metadata is applied after RetroBat closes.
 
-Console coverage totals, the selected-game summary and Start button update as covers finish. You do not need to close the application or rescan to see its downloads reflected. Artwork changes made by other programs still require **Scan library**.
+Console coverage totals, the selected-game summary and Start button update as covers finish. **Start scraping queues only games without artwork**, using the library scan and covers confirmed during the current session. It does not check already covered games again. You do not need to close the application or rescan to see its downloads reflected. Use **Scan library** after artwork is added, removed or changed outside NovaCore.
 
 The optional console search matches partial words regardless of spaces: `GameBoy`, `Game Boy`, `Game Advance` and `GBA` can find Game Boy Advance. Choosing a console hidden by a search clears that search and scrolls its row into view.
 
@@ -27,7 +27,7 @@ The optional console search matches partial words regardless of spaces: `GameBoy
 | Downloaded | Inspect completed artwork and its saved path, including downloads from earlier sessions. |
 | Settings | Configure providers, credentials, matching, retries and power options in a scrollable form inside the same window. |
 
-Download tables show 200 rows per page, with Previous/Next controls, so large queues do not create tens of thousands of UI rows. Cancelling work keeps already completed artwork. The progress bar stays visible in every tab: first it shows selected-game checks, then missing-artwork jobs processed. Downloaded, existing, missing, failed and cancelled counts stay separate; 100% processed does not mean every game had a matching cover.
+Download tables show 200 rows per page, with Previous/Next controls, so large queues do not create tens of thousands of UI rows. Cancelling work keeps already completed artwork. The progress bar stays visible in every tab: first it checks only the missing-artwork candidates, then shows artwork jobs processed. Previously covered games remain in Library totals rather than being added to the queue. Downloaded, existing, missing, failed and cancelled counts stay separate; 100% processed does not mean every game had a matching cover.
 
 The application reads the installation's system configuration where available and scans supported ROM files recursively. Scanning uses cached directory information, skips unrelated video/manual folders, and processes up to two consoles at a time. Autodetection stops as soon as it finds a valid installation. It honours existing artwork metadata and avoids linked directories. Ambiguous or unsupported library layouts may need manual artwork.
 
@@ -114,7 +114,7 @@ Some C64 collections use opaque disk labels such as `sb141167` or `0001a`. Those
 
 Each game's sources are tried in order until a cover saves; several games run concurrently. Automatic tries configured IGDB before TheGamesDB to preserve TheGamesDB's limited monthly allowance. After changing credentials, start a new run to use them. No credential values or request URLs are included in diagnostics.
 
-Existing artwork remains untouched. Starting the same consoles again checks completed files and works on remaining gaps. Missing means no acceptable cover was found under the selected policy; it is not proof that no cover exists anywhere. There is no manual game-identity picker in this version, and ambiguous records are reported rather than guessed.
+Existing artwork remains untouched. Starting the same consoles again queues only remaining gaps, including unfinished, missing and failed jobs. Completed covers remain excluded even while their metadata is pending. The background library scan registers NovaCore cover files left without recovery records after an interrupted save; these metadata updates still wait for RetroBat to close. Missing means no acceptable cover was found under the selected policy; it is not proof that no cover exists anywhere. There is no manual game-identity picker in this version, and ambiguous records are reported rather than guessed.
 
 ## RetroBat can stay open
 

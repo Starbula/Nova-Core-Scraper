@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from itertools import chain
 import logging
 import os
 from pathlib import Path
 import queue
+import sqlite3
 import threading
 import time
 import tkinter as tk
@@ -15,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import auth
 from .credentials import (configured_credentials, save_credentials, clear_credentials,
                           can_remember_credentials)
-from .engine import ScrapeEngine
+from .engine import ScrapeEngine, recover_scanned_artwork
 from .library import detect_installations
 from .scan import scan_library
 from .models import Game, System
@@ -230,6 +232,7 @@ class App:
         self.engine: ScrapeEngine | None = None
         self.games_by_system: dict[str, list[Game]] = {}
         self._existing_counts: dict[str, int] = {}
+        self._covered_game_keys: set[str] = set()
         self._last_artwork_check = 0.0
         self._selected_games = 0
         self._selected_existing = 0
@@ -907,7 +910,9 @@ class App:
         for system in self.selection.visible(self.filter_var.get()):
             games = self.games_by_system.get(system.name, ())
             if system.name not in self._existing_counts:
-                self._existing_counts[system.name] = sum(game.existing_artwork is not None for game in games)
+                covered = {game.key for game in games if game.existing_artwork is not None}
+                self._covered_game_keys.update(covered)
+                self._existing_counts[system.name] = len(covered)
             existing = self._existing_counts[system.name]
             checked = system.name in self.selection.selected
             self.tree.insert('', 'end', iid=system.name, image=self._checkbox_images[checked],
@@ -946,20 +951,29 @@ class App:
         self.start_button.configure(text=f'Start scraping · {self._selected_games:,} games · {missing:,} need artwork')
 
     def _refresh_artwork_counts(self, *, force=False) -> None:
-        getter = getattr(self.engine, 'artwork_counts', None)
+        updates = getattr(self.engine, 'take_artwork_updates', None)
+        getter = updates if callable(updates) else getattr(self.engine, 'artwork_counts', None)
         if not callable(getter):
             return
         now = time.monotonic()
         if not force and now-self._last_artwork_check < .5:
             return
         self._last_artwork_check = now
+        counts = getter()
+        if callable(updates):
+            counts_by_system = {}
+            for key, name in counts.items():
+                if name not in self.games_by_system or key in self._covered_game_keys:
+                    continue
+                self._covered_game_keys.add(key)
+                counts_by_system[name] = counts_by_system.get(name,self._existing_counts.get(name,0))+1
+            counts = counts_by_system
         changed = False
-        for name, covered in getter().items():
+        for name, covered in counts.items():
             games = self.games_by_system.get(name)
             if games is None:
                 continue
-            # A run reports only games it has checked so far. Keep the scan or
-            # previous run's baseline until that run catches up with it.
+            # Aggregate-only engines may still report partial preflight counts.
             existing = max(self._existing_counts.get(name,0), min(len(games),covered))
             if existing == self._existing_counts.get(name,0):
                 continue
@@ -1103,6 +1117,7 @@ class App:
         self.engine = None
         self.games_by_system = {}
         self._existing_counts = {}
+        self._covered_game_keys = set()
         self.selection.systems = []
         self.folder_var.set(str(folder))
         self._invalidate_pages()
@@ -1118,7 +1133,16 @@ class App:
         def progress(done, total, name):
             with self._scan_lock:
                 self._latest_scan = (done, total, name)
-        self._run_background('scan', lambda: scan_library(folder, cancelled=self._cancel_scan.is_set, progress=progress))
+        def operation():
+            result = scan_library(folder, cancelled=self._cancel_scan.is_set, progress=progress)
+            if result is not None and not self._cancel_scan.is_set():
+                root, _systems, games = result
+                try:
+                    recover_scanned_artwork(root, chain.from_iterable(games.values()), cancelled=self._cancel_scan.is_set)
+                except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                    LOG.warning('Artwork recovery deferred (%s).', type(exc).__name__)
+            return None if self._cancel_scan.is_set() else result
+        self._run_background('scan', operation)
 
     def _make_provider(self):
         cache = data_directory() / 'cache'
@@ -1161,22 +1185,27 @@ class App:
     def start(self) -> None:
         if self.busy or self._closing or not self.retrobat_root:
             return
+        games = self.selection.games(self.games_by_system)
+        if not games:
+            self.status_var.set('Choose a console or check consoles before starting.')
+            return
+        self._refresh_artwork_counts(force=True)
+        games = [game for game in games if game.existing_artwork is None
+                 and game.key not in self._covered_game_keys]
+        if not games:
+            self.status_var.set('No missing artwork in the selected consoles. Rescan to check for library changes.')
+            return
         if 'credentials-load' in self._background_threads:
             self.status_var.set(CREDENTIALS_LOADING)
             return
         if 'sources-check' in self._background_threads:
             self.status_var.set('Checking source access… Wait for the check to finish before starting.')
             return
-        games = self.selection.games(self.games_by_system)
-        if not games:
-            self.status_var.set('Choose a console or check consoles before starting.')
-            return
         if not self._apply_settings():
             self.show_settings()
             return
         try:
             provider = self._make_provider()
-            self._refresh_artwork_counts(force=True)
             self._diagnostic_provider = None
             self.engine = ScrapeEngine(self.retrobat_root, provider,
                                        retry_passes=2 if self.settings.retry_failed else 0,
@@ -1381,6 +1410,8 @@ class App:
             self.retrobat_root, systems, self.games_by_system = result
             self.folder_var.set(str(self.retrobat_root))
             self.selection.replace_systems(systems)
+            self._covered_game_keys = {game.key for games in self.games_by_system.values() for game in games
+                                       if game.existing_artwork is not None}
             self._existing_counts = {name: sum(game.existing_artwork is not None for game in games)
                                      for name, games in self.games_by_system.items()}
             self.engine = ScrapeEngine(self.retrobat_root, LibretroProvider(data_directory() / 'cache'))

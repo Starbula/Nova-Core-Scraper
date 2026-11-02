@@ -33,6 +33,14 @@ def retrobat_running() -> bool:
     return False
 
 
+def recover_scanned_artwork(root, games, *, cancelled=lambda: False) -> int:
+    """Register interrupted saves from scan results without rechecking artwork."""
+    if cancelled():
+        return 0
+    with InstallationLock(Path(root).absolute()), State(root) as state:
+        return state.recover_scanned_artwork(games, cancelled=cancelled)
+
+
 @dataclass(frozen=True)
 class Progress:
     total: int = 0
@@ -99,6 +107,7 @@ class ScrapeEngine:
         self._job_systems: dict[str, str] = {}
         self._covered_jobs: set[str] = set()
         self._artwork_counts: dict[str, int] = {}
+        self._artwork_updates: dict[str, str] = {}
         self._needed: set[str] = set()
         self._cancelled: set[str] = set()
         self._jobs_revision = 0
@@ -128,12 +137,19 @@ class ScrapeEngine:
         with self._condition:
             return dict(self._artwork_counts)
 
+    def take_artwork_updates(self) -> dict[str, str]:
+        """Consume newly covered game keys without copying or checking the library."""
+        with self._condition:
+            updates, self._artwork_updates = self._artwork_updates, {}
+            return updates
+
     def _cover_game(self, key: str) -> None:
         with self._condition:
             if key not in self._covered_jobs:
                 self._covered_jobs.add(key)
                 system = self._job_systems[key]
                 self._artwork_counts[system] = self._artwork_counts.get(system, 0)+1
+                self._artwork_updates[key] = system
 
     def jobs_page(self, query='', statuses=None, offset=0, limit=200) -> tuple[list[JobSnapshot], int]:
         """Read the submitted queue without filesystem I/O or copying the full queue."""
@@ -228,6 +244,7 @@ class ScrapeEngine:
             self._dirty_jobs.clear()
             self._games = {game.key: game for game in games}
             self._artwork_counts.clear()
+            self._artwork_updates.clear()
             self._jobs = {game.key: JobSnapshot(game.key, game.title, game.system.fullname, 'checking') for game in games}
             self._job_systems = {game.key: game.system.name for game in games}
             self._search = {game.key: _search_text(' '.join((game.title, game.system.fullname, game.key))) for game in games}

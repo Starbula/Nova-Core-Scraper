@@ -3,7 +3,9 @@ import sqlite3
 import threading
 import unittest
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
+from novacore_scraper.library import artwork_destination
 from novacore_scraper.models import System, Game
 from novacore_scraper.state import State, InstallationLock
 
@@ -71,6 +73,58 @@ class StateTests(unittest.TestCase):
             state.downloaded(self.game, art, history=False)
             self.assertEqual(len(state.pending()), 1)
         self.assertEqual(State.downloaded_page(self.root), ([], 0))
+
+    def test_recover_scanned_artwork_queues_unregistered_own_file_without_history(self):
+        art = artwork_destination(self.game)
+        art.parent.mkdir(parents=True)
+        art.write_bytes(b'Scan-confirmed artwork')
+        game = replace(self.game, existing_artwork=art)
+        with State(self.root) as state:
+            state.record(game, 'downloading', source='Libretro', attempts=1)
+            self.assertEqual(state.recover_scanned_artwork([game, game]), 1)
+        with State(self.root) as state:
+            row = state.pending()[0]
+            self.assertEqual(row['relative_path'], 'Game.nes')
+            self.assertEqual(row['artwork'], art.relative_to(self.root).as_posix())
+            self.assertEqual((row['source'], row['attempts']), ('Libretro', 1))
+            self.assertEqual(state.recover_scanned_artwork([game]), 0)
+        self.assertEqual(State.downloaded_page(self.root), ([], 0))
+        self.assertEqual(art.read_bytes(), b'Scan-confirmed artwork')
+
+    def test_recover_scanned_artwork_preserves_registered_pending_and_applied_rows(self):
+        pending = replace(self.game, existing_artwork=artwork_destination(self.game))
+        applied = replace(self.game, path=self.path/'Applied.nes', relative_path='Applied.nes', title='Applied')
+        applied = replace(applied, existing_artwork=artwork_destination(applied))
+        with State(self.root) as state:
+            for game in (pending, applied):
+                state.downloaded(game, game.existing_artwork, reason='downloaded', source='Libretro', attempts=2)
+            state.applied(['roms/nes/Applied.nes'])
+            before = [dict(row) for row in state.db.execute('SELECT * FROM jobs ORDER BY key')]
+            self.assertEqual(state.recover_scanned_artwork([pending, applied]), 0)
+            self.assertEqual([dict(row) for row in state.db.execute('SELECT * FROM jobs ORDER BY key')], before)
+            self.assertEqual([row['relative_path'] for row in state.pending()], ['Game.nes'])
+
+    def test_recover_scanned_artwork_ignores_other_existing_artwork_and_missing_games(self):
+        other = replace(self.game, existing_artwork=self.path/'images'/'external.png')
+        shared = replace(self.game, existing_artwork=self.root/'shared-cover.png')
+        with State(self.root) as state:
+            self.assertEqual(state.recover_scanned_artwork([other, shared, self.game]), 0)
+            self.assertEqual(state.pending(), [])
+            self.assertEqual(state.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+
+    def test_recover_scanned_artwork_stops_cooperatively_when_cancelled(self):
+        games = [replace(self.game, path=self.path/f'{index}.nes', relative_path=f'{index}.nes') for index in range(3)]
+        games = [replace(game, existing_artwork=artwork_destination(game)) for game in games]
+        checks = 0
+        def cancelled():
+            nonlocal checks
+            checks += 1
+            return checks > 1
+        with State(self.root) as state:
+            self.assertEqual(state.recover_scanned_artwork(games, cancelled), 1)
+        with State(self.root) as state:
+            self.assertEqual([row['relative_path'] for row in state.pending()], ['0.nes'])
+            self.assertEqual(state.recover_scanned_artwork(games, lambda:True), 0)
 
     def test_downloaded_history_pages_queries_and_caps_limit(self):
         system = System('gba', 'Nintendo Game Boy Advance', self.path, frozenset({'.gba'}))

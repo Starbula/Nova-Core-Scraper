@@ -1,6 +1,7 @@
 """Selection/worker tests run headless; real Tk checks run where a display exists."""
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 import queue
 import tempfile
 import threading
@@ -154,6 +155,249 @@ class ConsoleSelectionTests(unittest.TestCase):
             app._post(index)
         self.assertEqual(app._events.qsize(), 4)
         self.assertEqual([app._events.get_nowait() for _ in range(4)], [96, 97, 98, 99])
+
+
+class MissingArtworkQueueTests(unittest.TestCase):
+    """Queue and coverage regressions also run without a Tk display."""
+
+    def make_app(self, games_by_system, selected):
+        def variable(initial=''):
+            value = SimpleNamespace(value=initial)
+            value.get = lambda:value.value
+            value.set = lambda text:setattr(value, 'value', text)
+            return value
+
+        app = ui.App.__new__(ui.App)
+        app._worker_kind = ''
+        app._closing = False
+        app._background_threads = {}
+        app.engine = None
+        app.retrobat_root = Path('/fixture')
+        app.settings = Settings()
+        app.selection = ui.ConsoleSelection(selected)
+        app.selection.replace_systems([games[0].system for games in games_by_system.values()])
+        app.games_by_system = games_by_system
+        app._covered_game_keys = {game.key for games in games_by_system.values() for game in games
+                                  if game.existing_artwork is not None}
+        app._existing_counts = {name:sum(game.existing_artwork is not None for game in games)
+                                for name,games in games_by_system.items()}
+        app._last_artwork_check = 0
+        app.scope_var = variable()
+        app.status_var = variable()
+        app.selection_var = variable('Selected consoles')
+        app.start_button = SimpleNamespace(configure=lambda **options:None)
+        app.tree = SimpleNamespace(exists=lambda name:False)
+        app.notebook = SimpleNamespace(select=lambda tab:None)
+        app.downloads_tab = object()
+        app._apply_settings = lambda:True
+        app._make_provider = lambda:object()
+        app._render_sources = lambda **options:None
+        app._invalidate_pages = lambda:None
+        app._request_page = lambda *args,**options:None
+        app._refresh_buttons = lambda:None
+        app._refresh_scope_counts()
+        return app
+
+    def capture_start(self, app):
+        submitted = []
+        class Engine:
+            active = False
+            def __init__(self,*args,**options):
+                pass
+            def start(self,games):
+                submitted.extend(game.key for game in games)
+        with patch.object(ui,'ScrapeEngine',Engine):
+            app.start()
+        return submitted
+
+    def test_start_submits_only_missing_games_across_selected_hidden_consoles(self):
+        nes, _snes, psx = systems()
+        games = {
+            'nes':[Game(nes,nes.path/'old.nes','old.nes','Old',nes.path/'old.png'),
+                   Game(nes,nes.path/'new.nes','new.nes','New')],
+            'psx':[Game(psx,psx.path/'new.cue','new.cue','New')],
+            'gba':[Game(gameboy_systems()[-1],Path('/fixture/gba/new.gba'),'new.gba','New')],
+        }
+        app = self.make_app(games,['nes','psx'])
+        app.selection.visible('Sony')
+        self.assertEqual(self.capture_start(app),['nes/new.nes','psx/new.cue'])
+
+    def test_start_absorbs_final_completed_cover_before_replacing_engine(self):
+        nes = systems()[0]
+        titles = ('Old','Completed','Failed','Cancelled','Missing')
+        games = [Game(nes,nes.path/f'{title}.nes',f'{title}.nes',title,
+                      nes.path/'old.png' if title == 'Old' else None) for title in titles]
+        app = self.make_app({'nes':games},['nes'])
+        updates = {'nes/Completed.nes':'nes'}
+        app.engine = SimpleNamespace(active=False, snapshot=lambda:Progress(completed=1,pending=1),
+            take_artwork_updates=lambda:dict(updates), artwork_counts=lambda:{'nes':1})
+        self.assertEqual(self.capture_start(app),['nes/Failed.nes','nes/Cancelled.nes','nes/Missing.nes'])
+        self.assertIn('2 existing covers',app.scope_var.get())
+
+    def test_delta_coverage_adds_to_scan_baseline_once_without_rescanning_games(self):
+        nes = systems()[0]
+        games = [Game(nes,nes.path/f'{index}.nes',f'{index}.nes',str(index),
+                      nes.path/'old.png' if index < 3 else None) for index in range(5)]
+        app = self.make_app({'nes':games},['nes'])
+        class NoGameScan(list):
+            def __iter__(self):
+                raise AssertionError('Live coverage must not rescan games.')
+        app.games_by_system = {'nes':NoGameScan(games)}
+        updates = {'nes/0.nes':'nes','nes/3.nes':'nes','nes/4.nes':'nes'}
+        app.engine = SimpleNamespace(take_artwork_updates=lambda:dict(updates),
+                                     artwork_counts=lambda:{'nes':2})
+        app._refresh_artwork_counts(force=True)
+        app._refresh_artwork_counts(force=True)
+        self.assertIn('5 existing covers · 0 missing covers',app.scope_var.get())
+
+    def test_all_covered_start_preserves_engine_and_pending_metadata_without_provider_setup(self):
+        nes = systems()[0]
+        app = self.make_app({'nes':[Game(nes,nes.path/'game.nes','game.nes','Game')]},['nes'])
+        previous = SimpleNamespace(active=False,snapshot=lambda:Progress(completed=1,pending=1),
+            take_artwork_updates=lambda:{'nes/game.nes':'nes'},artwork_counts=lambda:{'nes':1})
+        app.engine = previous
+        with patch.object(app,'_apply_settings',side_effect=AssertionError('No settings work is needed.')), \
+             patch.object(app,'_make_provider',side_effect=AssertionError('No provider is needed.')):
+            app.start()
+        self.assertIs(app.engine,previous)
+        self.assertEqual(app.engine.snapshot().pending,1)
+        self.assertIn('No missing artwork',app.status_var.get())
+
+    def test_fresh_scan_forgets_same_session_cover_for_artwork_removed_before_rescan(self):
+        nes = systems()[0]
+        game = Game(nes,nes.path/'game.nes','game.nes','Game')
+        app = self.make_app({'nes':[game]},['nes'])
+        app._covered_game_keys.add(game.key)
+        app._existing_counts['nes'] = 1
+        app._generation = 1
+        app._scan_lock = threading.Lock()
+        app._latest_scan = None
+        app.folder_var = SimpleNamespace(set=lambda text:None)
+        app.state_var = SimpleNamespace(set=lambda text:None)
+        app.progress_var = SimpleNamespace(set=lambda text:None)
+        app.progress = SimpleNamespace(configure=lambda **options:None)
+        app._render_systems = lambda:None
+        app._persist = lambda:None
+        with patch.object(ui,'ScrapeEngine',return_value=SimpleNamespace(active=False)):
+            app._handle_result((1,'scan',(Path('/fixture'),[nes],{'nes':[game]}),None))
+        self.assertEqual(self.capture_start(app),['nes/game.nes'])
+
+    def test_repeated_start_with_real_engine_checks_only_missing_artwork_while_metadata_is_pending(self):
+        from PIL import Image
+        from novacore_scraper import engine as engine_module
+        from novacore_scraper.library import artwork_destination
+        from novacore_scraper.models import Artwork
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            system = System('nes','Nintendo Entertainment System',root/'roms'/'nes',frozenset({'.nes'}))
+            system.path.mkdir(parents=True)
+            existing, new, missing = [Game(system,system.path/f'{title}.nes',f'{title}.nes',title)
+                                      for title in ('Existing','New','Missing')]
+            for game in (existing,new,missing):
+                game.path.write_bytes(b'ROM unchanged')
+            existing_cover = artwork_destination(existing)
+            existing_cover.parent.mkdir(parents=True)
+            Image.new('RGB',(2,2),'blue').save(existing_cover)
+            existing = replace(existing,existing_artwork=existing_cover)
+            app = self.make_app({'nes':[existing,new,missing]},['nes'])
+            app.retrobat_root = root
+            app.settings = replace(app.settings,retry_failed=False,keep_awake=False)
+            lookups, checked = [], []
+            covered = {existing.key}
+            real_check = engine_module.existing_artwork
+            def check(game):
+                checked.append(game.key)
+                if game.key in covered:
+                    raise AssertionError('A covered game must not be checked again.')
+                return real_check(game)
+            class Provider:
+                workers = 1
+                def prepare(self,checkpoint):
+                    checkpoint()
+                def find(self,game,checkpoint):
+                    checkpoint()
+                    lookups.append(game.key)
+                    return Artwork('https://fixture.invalid/cover.png','fixture') if game.key == new.key else None
+                def download(self,artwork,destination,checkpoint):
+                    checkpoint()
+                    Image.new('RGB',(2,2),'red').save(destination)
+            real_engine = engine_module.ScrapeEngine
+            def make_engine(*args,**options):
+                return real_engine(*args,process_running=lambda:True,**options)
+            with patch.object(app,'_make_provider',side_effect=Provider), \
+                 patch.object(ui,'ScrapeEngine',side_effect=make_engine), \
+                 patch.object(engine_module,'existing_artwork',side_effect=check):
+                try:
+                    app.start()
+                    self.assertTrue(app.engine.wait(5))
+                    self.assertEqual(app.engine.snapshot().state,'Finished')
+                    self.assertEqual(app.engine.snapshot().checked,2)
+                    self.assertEqual(app.engine.snapshot().pending,1)
+                    self.assertEqual(set(checked),{'nes/New.nes','nes/Missing.nes'})
+                    self.assertCountEqual(lookups,['nes/New.nes','nes/Missing.nes'])
+                    downloaded = artwork_destination(new).read_bytes()
+                    checked.clear()
+                    lookups.clear()
+                    covered.add(new.key)
+                    app.start()  # Absorbs the completed cover before any ordinary UI poll.
+                    self.assertTrue(app.engine.wait(5))
+                    self.assertEqual(app.engine.snapshot().state,'Finished')
+                    self.assertEqual(app.engine.snapshot().checked,1)
+                    self.assertEqual(app.engine.snapshot().pending,1)
+                    self.assertEqual(set(checked),{'nes/Missing.nes'})
+                    self.assertEqual(lookups,['nes/Missing.nes'])
+                    self.assertEqual(artwork_destination(new).read_bytes(),downloaded)
+                    self.assertIn('2 existing covers · 1 missing covers',app.scope_var.get())
+                finally:
+                    if app.engine:
+                        app.engine.stop()
+                        app.engine.wait(5)
+
+    def test_scan_recovers_orphan_cover_metadata_without_starting_artwork_jobs(self):
+        from PIL import Image
+        from xml.etree import ElementTree as ET
+        from novacore_scraper import engine as engine_module
+        from novacore_scraper.library import artwork_destination
+        from novacore_scraper.state import State
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root/'retrobat.exe').write_bytes(b'fixture')
+            system = System('nes','Nintendo Entertainment System',root/'roms'/'nes',frozenset({'.nes'}))
+            system.path.mkdir(parents=True)
+            game = Game(system,system.path/'Orphan.nes','Orphan.nes','Orphan')
+            game.path.write_bytes(b'ROM unchanged')
+            cover = artwork_destination(game)
+            cover.parent.mkdir(parents=True)
+            Image.new('RGB',(2,2),'blue').save(cover)
+            app = self.make_app({'nes':[game]},['nes'])
+            app._generation = 1
+            app._scan_lock = threading.Lock()
+            app._cancel_scan = threading.Event()
+            app.folder_var = SimpleNamespace(value=str(root))
+            app.folder_var.get = lambda:app.folder_var.value
+            app.folder_var.set = lambda value:setattr(app.folder_var,'value',value)
+            app.state_var = app.progress_var = app.counts_var = SimpleNamespace(set=lambda value:None)
+            app.progress = SimpleNamespace(configure=lambda **options:None)
+            app._render_systems = app._persist = lambda:None
+            operations = []
+            app._run_background = lambda kind,operation:operations.append(operation)
+            with patch.object(engine_module,'existing_artwork',side_effect=AssertionError('Covered artwork must not be rechecked.')):
+                app._begin_scan(root)
+                result = operations[0]()
+                with State(root) as state:
+                    self.assertEqual([row['relative_path'] for row in state.pending()],['Orphan.nes'])
+                self.assertFalse((system.path/'gamelist.xml').exists())
+                app._handle_result((1,'scan',result,None))
+                engine = app.engine
+                with patch.object(app,'_make_provider',side_effect=AssertionError('No provider is needed.')):
+                    app.start()
+                self.assertIs(app.engine,engine)
+                self.assertEqual(engine.snapshot().total,0)
+                engine.process_running = lambda:False
+                engine.apply_pending()
+            self.assertEqual(engine.snapshot().pending,0)
+            self.assertEqual(ET.parse(system.path/'gamelist.xml').findtext('game/thumbnail'),
+                             './'+cover.relative_to(system.path).as_posix())
 
 
 class TkTests(unittest.TestCase):
