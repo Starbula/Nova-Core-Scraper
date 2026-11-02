@@ -194,11 +194,17 @@ class WorkflowTests(unittest.TestCase):
         jobs, _ = self.app.engine.jobs_page()
         self.assertEqual({job.title: job.detail for job in jobs}, {
             'Game 0': 'Source: Libretro', 'Game 1': 'Source: LaunchBox', 'Game 2': 'Source: LaunchBox'})
-        with patch.object(self.app, '_make_provider', return_value=chain):
+        completed_run = self.app.engine
+        downloads = (tuple(first.downloads), tuple(second.downloads))
+        with patch.object(self.app, '_make_provider', side_effect=AssertionError('Covered games need no provider.')), \
+             patch('novacore_scraper.engine.existing_artwork', side_effect=AssertionError('Covered games must not be rechecked.')):
             self.app.start()
-        self.pump(lambda: not self.app.engine.active)
-        self.assertEqual((self.app.engine.snapshot().skipped, self.app.engine.snapshot().completed), (3, 0))
+            self.assertIn('No missing artwork', self.app.status_var.get())
+            self.pump(lambda: not self.app.engine.active)
+        self.assertIs(self.app.engine, completed_run)
+        self.assertEqual((self.app.engine.snapshot().skipped, self.app.engine.snapshot().completed), (0, 3))
         self.assertEqual((len(first.games), len(second.games)), (3, 2))
+        self.assertEqual((tuple(first.downloads), tuple(second.downloads)), downloads)
 
     def test_configured_run_shows_igdb_checks_and_tgdb_quota_without_losing_fallback(self):
         from novacore_scraper.providers import QuotaError
